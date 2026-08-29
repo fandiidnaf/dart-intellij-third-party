@@ -38,11 +38,42 @@ public final class DartDocUtil {
   private static final String GT = "&gt;";
   private static final String LT = "&lt;";
 
-  public static @Nullable @Nls String generateDoc(final PsiElement element) {
+  public static @Nullable @Nls String generateDoc(PsiElement element) {
+    if (element == null) return null;
+
+    final DartFieldFormalParameter fieldFormalParameter = PsiTreeUtil.getParentOfType(element, DartFieldFormalParameter.class, false);
+    if (fieldFormalParameter != null) {
+      PsiElement target = fieldFormalParameter.getReferenceExpression().resolve();
+      if (target == null) {
+        final DartClass dartClass = PsiTreeUtil.getParentOfType(fieldFormalParameter, DartClass.class);
+        if (dartClass != null) {
+          final List<DartComponent> members = dartClass.findMembersByName(fieldFormalParameter.getReferenceExpression().getText());
+          if (!members.isEmpty()) {
+            target = members.get(0);
+          }
+        }
+      }
+      if (target != null) {
+        element = target;
+      }
+    }
+    else if (element instanceof DartReferenceExpression || element.getParent() instanceof DartReferenceExpression) {
+      final DartReferenceExpression ref = (DartReferenceExpression)(element instanceof DartReferenceExpression ? element : element.getParent());
+      if (!(element instanceof DartComponent)) {
+        final PsiElement target = ref.resolve();
+        if (target != null) {
+          element = target;
+        }
+      }
+    }
+
     if (!(element instanceof DartComponent) && !(element.getParent() instanceof DartComponent)) {
       return null;
     }
-    final DartComponent namedComponent = (DartComponent)(element instanceof DartComponent ? element : element.getParent());
+    DartComponent namedComponent = (DartComponent)(element instanceof DartComponent ? element : element.getParent());
+    if (namedComponent instanceof DartComponentName && namedComponent.getParent() instanceof DartComponent) {
+      namedComponent = (DartComponent)namedComponent.getParent();
+    }
 
     final String signatureHtml;
     {
@@ -247,6 +278,9 @@ public final class DartDocUtil {
     if (!(element instanceof DartComponent)) {
       element = element.getParent();
     }
+    if (element instanceof DartComponentName && element.getParent() instanceof DartComponent) {
+      element = element.getParent();
+    }
     if (element instanceof DartComponent) {
       final StringBuilder sb = new StringBuilder();
       appendSignature((DartComponent)element, sb);
@@ -290,6 +324,13 @@ public final class DartDocUtil {
       builder.append(((DartEnumDefinition)namedComponent.getParent()).getName()).append(" ");
       builder.append("<b>").append(namedComponent.getName()).append("</b>");
     }
+    else if (namedComponent instanceof DartNormalFormalParameter) {
+      final DartType type = DartResolveUtil.findType(namedComponent);
+      appendVariableSignature(builder, namedComponent, type);
+    }
+    else if (namedComponent instanceof DartSimpleFormalParameter) {
+      appendVariableSignature(builder, namedComponent, ((DartSimpleFormalParameter)namedComponent).getType());
+    }
   }
 
 
@@ -314,9 +355,14 @@ public final class DartDocUtil {
     PsiElement anchorElement = dartComponent;
 
     final PsiElement parent = dartComponent.getParent();
-    if (parent instanceof DartClassMembers && parent.getFirstChild() == dartComponent ||
-        dartComponent instanceof DartVarAccessDeclaration) {
+    if (parent instanceof DartClassMembers && parent.getFirstChild() == dartComponent) {
       anchorElement = parent;
+    }
+    else if (dartComponent instanceof DartVarAccessDeclaration) {
+      anchorElement = parent;
+      if (parent != null && parent.getParent() instanceof DartClassMembers && parent.getParent().getFirstChild() == parent) {
+        anchorElement = parent.getParent();
+      }
     }
 
     // 3. Look for multiline doc comment or line doc comments as previous siblings

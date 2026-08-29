@@ -10,8 +10,11 @@ import com.intellij.psi.util.PsiTreeUtil;
 import com.jetbrains.lang.dart.analyzer.DartAnalysisServerService;
 import com.jetbrains.lang.dart.analyzer.DartFileInfo;
 import com.jetbrains.lang.dart.analyzer.DartFileInfoKt;
+import com.jetbrains.lang.dart.psi.DartComponent;
 import com.jetbrains.lang.dart.psi.DartComponentName;
+import com.jetbrains.lang.dart.psi.DartFieldFormalParameter;
 import com.jetbrains.lang.dart.psi.DartId;
+import com.jetbrains.lang.dart.psi.DartReferenceExpression;
 import org.dartlang.analysis.server.protocol.Location;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -40,6 +43,15 @@ public class DartLookupObject {
     String filePathOrUri = myLocation.getFile();
     DartFileInfo fileInfo = DartFileInfoKt.getDartFileInfo(myProject, filePathOrUri);
     VirtualFile vFile = fileInfo.findFile();
+    if (vFile == null) {
+      vFile = com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl(filePathOrUri);
+    }
+    if (vFile == null && !filePathOrUri.contains("://")) {
+      vFile = com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl("file://" + filePathOrUri);
+    }
+    if (vFile == null && !filePathOrUri.contains("://")) {
+      vFile = com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl("temp://" + filePathOrUri);
+    }
     final PsiFile psiFile = vFile == null ? null : PsiManager.getInstance(myProject).findFile(vFile);
     if (psiFile != null) {
       final int offset = DartAnalysisServerService.getInstance(myProject).getConvertedOffset(vFile, myLocation.getOffset());
@@ -48,6 +60,33 @@ public class DartLookupObject {
         final DartComponentName componentName = PsiTreeUtil.getParentOfType(elementAtOffset, DartComponentName.class);
         if (componentName != null) {
           return componentName;
+        }
+        final DartFieldFormalParameter fieldFormalParameter = PsiTreeUtil.getParentOfType(elementAtOffset, DartFieldFormalParameter.class);
+        if (fieldFormalParameter != null) {
+          PsiElement target = fieldFormalParameter.getReferenceExpression().resolve();
+          if (target == null) {
+            final com.jetbrains.lang.dart.psi.DartClass dartClass = PsiTreeUtil.getParentOfType(fieldFormalParameter, com.jetbrains.lang.dart.psi.DartClass.class);
+            if (dartClass != null) {
+              final java.util.List<DartComponent> members = dartClass.findMembersByName(fieldFormalParameter.getReferenceExpression().getText());
+              if (!members.isEmpty()) {
+                target = members.get(0);
+              }
+            }
+          }
+          if (target != null) {
+            return target;
+          }
+        }
+        final DartReferenceExpression referenceExpression = PsiTreeUtil.getParentOfType(elementAtOffset, DartReferenceExpression.class);
+        if (referenceExpression != null) {
+          final PsiElement target = referenceExpression.resolve();
+          if (target != null) {
+            return target;
+          }
+        }
+        final DartComponent component = PsiTreeUtil.getParentOfType(elementAtOffset, DartComponent.class);
+        if (component != null) {
+          return component;
         }
         if (elementAtOffset.getParent() instanceof DartId && elementAtOffset.getTextRange().getStartOffset() == offset) {
           return elementAtOffset; // example in WEB-25478 (https://github.com/flutter/flutter-intellij/issues/385#issuecomment-278826063)

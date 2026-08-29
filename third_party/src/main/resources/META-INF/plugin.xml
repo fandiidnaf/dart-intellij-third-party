@@ -1,5 +1,5 @@
 <idea-plugin>
-  <name>Dart</name>
+  <name>Dart-Custom</name>
   <id>Dart</id>
   <description><![CDATA[
     <p>Provides <a href="https://dart.dev/">Dart</a> support to JetBrains IDEs and Android Studio.

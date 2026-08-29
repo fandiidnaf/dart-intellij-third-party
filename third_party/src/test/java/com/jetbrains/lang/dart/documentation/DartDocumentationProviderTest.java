@@ -95,36 +95,66 @@ public class DartDocumentationProviderTest extends DartCodeInsightFixtureTestCas
   public void testGenerateDocWithAndWithoutActiveLookup() {
     DartConfigurable.setExperimentalLspFeaturesEnabled(getProject(), true);
 
-    final PsiFile psiFile = myFixture.addFileToProject("test.dart", "/// Documentation for class A\nclass A {}");
+    final PsiFile psiFile = myFixture.addFileToProject("test.dart",
+      "/// Documentation for class A\n" +
+      "class A {\n" +
+      "  /// Documentation for property prop\n" +
+      "  int prop;\n" +
+      "}");
     myFixture.configureFromExistingVirtualFile(psiFile.getVirtualFile());
-    final PsiElement element = PsiTreeUtil.getParentOfType(psiFile.findElementAt(psiFile.getText().indexOf("A {}")), DartComponent.class);
-    assertNotNull(element);
 
-    // 1. Without an active lookup, generateDoc returns null when experimental LSP features is enabled
-    assertNull("Expected null doc without active lookup", myProvider.generateDoc(element, null));
+    // 1. Without an active lookup, generateDoc generates doc for class directly
+    final PsiElement classElement = PsiTreeUtil.getParentOfType(psiFile.findElementAt(psiFile.getText().indexOf("A {")), DartComponent.class);
+    assertNotNull(classElement);
+    final String classDoc = myProvider.generateDoc(classElement, null);
+    assertNotNull("Expected non-null doc without active lookup for class", classDoc);
+    assertTrue("Expected doc to contain class documentation", classDoc.contains("Documentation for class A"));
 
-    // 2. With an active lookup containing DartLookupObject, generateDoc generates doc
+    // 2. Without an active lookup, generateDoc generates doc for class property directly
+    final PsiElement propertyElement = PsiTreeUtil.getParentOfType(psiFile.findElementAt(psiFile.getText().indexOf("prop;")), DartComponent.class);
+    assertNotNull(propertyElement);
+    final String propDoc = myProvider.generateDoc(propertyElement, null);
+    assertNotNull("Expected non-null doc without active lookup for property", propDoc);
+    assertTrue("Expected doc to contain property documentation", propDoc.contains("Documentation for property prop"));
+    assertTrue("Expected doc to contain containing class info", propDoc.contains("Containing class:</b> A"));
+
+    // 3. With an active lookup containing DartLookupObject, generateDoc generates doc
     LookupElement lookupElement =
       LookupElementBuilder.create(new DartLookupObject(getProject(), null, 0), "A");
     LookupManager.getInstance(getProject()).showLookup(myFixture.getEditor(), lookupElement);
     try {
-      final String doc = myProvider.generateDoc(element, null);
+      final String doc = myProvider.generateDoc(classElement, null);
       assertNotNull("Expected non-null doc with active DartLookupObject", doc);
       assertTrue("Expected doc to contain class documentation", doc.contains("Documentation for class A"));
     }
     finally {
       LookupManager.getInstance(getProject()).hideActiveLookup();
     }
+  }
 
-    // 3. With an active lookup containing a non-DartLookupObject, generateDoc returns null
-    LookupElement plainLookupElement =
-      LookupElementBuilder.create("plain");
-    LookupManager.getInstance(getProject()).showLookup(myFixture.getEditor(), plainLookupElement);
-    try {
-      assertNull("Expected null doc with non-DartLookupObject", myProvider.generateDoc(element, null));
-    }
-    finally {
-      LookupManager.getInstance(getProject()).hideActiveLookup();
-    }
+  public void testConstructorFieldFormalParameterLookupDoc() {
+    final PsiFile psiFile = myFixture.addFileToProject("main.dart",
+      "/// this is main bab\n" +
+      "class Main {\n" +
+      "  /// name bro\n" +
+      "  final String name;\n" +
+      "  /// hello bro\n" +
+      "  final String hello;\n" +
+      "  Main({required this.name, required this.hello});\n" +
+      "}");
+    myFixture.configureFromExistingVirtualFile(psiFile.getVirtualFile());
+
+    final int nameParamOffset = psiFile.getText().indexOf("this.name") + "this.".length();
+    final org.dartlang.analysis.server.protocol.Location location =
+      new org.dartlang.analysis.server.protocol.Location(psiFile.getVirtualFile().getPath(), nameParamOffset, 4, 1, 1, 1, 5);
+    final DartLookupObject lookupObject = new DartLookupObject(getProject(), location, 0);
+
+    final PsiElement resolvedElement = myProvider.getDocumentationElementForLookupItem(getPsiManager(), lookupObject, null);
+    assertNotNull("Expected resolved element for constructor field parameter lookup", resolvedElement);
+
+    final String doc = myProvider.generateDoc(resolvedElement, null);
+    assertNotNull("Expected generated doc for constructor field parameter lookup", doc);
+    assertTrue("Expected doc to contain field documentation", doc.contains("name bro"));
+    assertTrue("Expected doc to contain containing class info", doc.contains("Containing class:</b> Main"));
   }
 }

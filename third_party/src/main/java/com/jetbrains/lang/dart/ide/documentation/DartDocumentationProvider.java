@@ -1,9 +1,6 @@
 // Copyright 2000-2024 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license.
 package com.jetbrains.lang.dart.ide.documentation;
 
-import com.intellij.codeInsight.lookup.Lookup;
-import com.intellij.codeInsight.lookup.LookupElement;
-import com.intellij.codeInsight.lookup.LookupManager;
 import com.intellij.lang.documentation.DocumentationProvider;
 import com.intellij.navigation.NavigationItem;
 import com.intellij.openapi.project.Project;
@@ -32,13 +29,7 @@ public final class DartDocumentationProvider implements DocumentationProvider {
 
   @Override
   public @Nls String generateDoc(final @NotNull PsiElement element, final @Nullable PsiElement originalElement) {
-    final Lookup activeLookup = LookupManager.getInstance(element.getProject()).getActiveLookup();
-    final LookupElement item = activeLookup != null ? activeLookup.getCurrentItem() : null;
-    final boolean isFromCompletion = item != null && item.getObject() instanceof DartLookupObject;
-    if (isFromCompletion) {
-      return DartDocUtil.generateDoc(element);
-    }
-    return null;
+    return DartDocUtil.generateDoc(element);
   }
 
   @Override
