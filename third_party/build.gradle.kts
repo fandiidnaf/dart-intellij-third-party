@@ -84,7 +84,9 @@ repositories {
 
 intellijPlatform {
     pluginConfiguration {
-        if (project.hasProperty("dev")) {
+        if (providers.gradleProperty("pluginVersion").isPresent) {
+            version = providers.gradleProperty("pluginVersion")
+        } else if (project.hasProperty("dev")) {
             val latestVersion = changelog.getLatest().version
             val nextMajorVersion = latestVersion.substringBefore('.').toInt() + 1
             val datestamp = DateTimeFormatter.ofPattern("yyyyMMdd").format(LocalDate.now())
