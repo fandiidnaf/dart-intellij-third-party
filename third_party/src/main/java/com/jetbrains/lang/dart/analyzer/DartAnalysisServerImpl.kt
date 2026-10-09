@@ -3,6 +3,7 @@ package com.jetbrains.lang.dart.analyzer
 
 import com.google.dart.server.AnalysisServerSocket
 import com.google.dart.server.DartLspWorkspaceApplyEditRequestConsumer
+import com.google.dart.server.DartLspWorkspaceConfigurationConsumer
 import com.google.dart.server.ShowMessageRequestConsumer
 import com.google.dart.server.internal.remote.RemoteAnalysisServerImpl
 import com.intellij.ide.BrowserUtil
@@ -16,8 +17,17 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.NlsSafe
 import com.intellij.util.concurrency.annotations.RequiresWriteLock
 import com.jetbrains.lang.dart.DartBundle
+import com.jetbrains.lang.dart.logging.PluginLogger
+import com.jetbrains.lang.dart.lsp.DartLspConfigurationSync
+import com.jetbrains.lang.dart.lsp.DartLspInlayHintsConfiguration
+import com.jetbrains.lang.dart.sdk.DartConfigurable
 import kotlinx.coroutines.launch
 import org.dartlang.analysis.server.protocol.*
+
+private val LOG = PluginLogger.createLogger(DartAnalysisServerImpl::class.java)
+
+/** The name of the configuration section of the Dart Analysis Server. */
+private const val DART_CONFIGURATION_SECTION = "dart"
 
 internal class DartAnalysisServerImpl(private val project: Project, socket: AnalysisServerSocket) : RemoteAnalysisServerImpl(socket) {
 
@@ -53,6 +63,12 @@ internal class DartAnalysisServerImpl(private val project: Project, socket: Anal
   }
 
   override fun lsp_workspaceApplyEdit(params: DartLspApplyWorkspaceEditParams, consumer: DartLspWorkspaceApplyEditRequestConsumer) {
+    if (DartConfigurable.isExperimentalLspFeaturesEnabled(project)) {
+      // When experimental LSP features are enabled, workspace/applyEdit is handled by DartBridgeLspServer,
+      // which forwards it to the LSP LanguageClient proxy and sends the legacy response to DAS when applied.
+      return
+    }
+
     DartAnalysisServerService.getInstance(project).serviceScope.launch {
       val label: @NlsSafe String? = params.label
       val commandName: String = label ?: DartBundle.message("code.changes.by.dart.analysis.server")
@@ -69,14 +85,49 @@ internal class DartAnalysisServerImpl(private val project: Project, socket: Anal
     }
   }
 
+  /**
+   * Answers the `workspace/configuration` request of the server. The server blocks its
+   * initialization until it gets an answer, so every requested section gets an entry: the settings
+   * of the Dart plugin for the `dart` section, `null` for anything else.
+   *
+   * Called on the response reader thread of the server; reading the settings needs neither the EDT
+   * nor a read action.
+   */
+  override fun lsp_workspaceConfiguration(sections: List<String?>, consumer: DartLspWorkspaceConfigurationConsumer) {
+    val dartSection =
+      if (sections.contains(DART_CONFIGURATION_SECTION)) DartLspInlayHintsConfiguration.buildDartSection() else null
+
+    consumer.computedConfiguration(sections.map { section ->
+      when (section) {
+        DART_CONFIGURATION_SECTION -> dartSection
+        else -> null
+      }
+    })
+
+    // Only after the answer is out: what the server now knows is the yardstick for noticing that
+    // the settings have changed, and answering must not depend on it.
+    if (dartSection != null) {
+      DartLspConfigurationSync.getInstance(project).configurationSentToServer(dartSection)
+    }
+  }
+
   @RequiresWriteLock
   private fun applyWorkspaceEdit(workspaceEdit: DartLspWorkspaceEdit): Boolean {
-    val changes = workspaceEdit.changes ?: return false
-    changes.entries.forEach { entry ->
-      val uri = entry.key
-      val virtualFile = getDartFileInfo(project, uri).findFile() ?: return false
-      val document = FileDocumentManager.getInstance().getDocument(virtualFile) ?: return false
-      if (!applyTextEdits(document, entry.value)) return false
+    val documentChanges = workspaceEdit.documentChanges ?: return false
+
+    for (change in documentChanges) {
+      when (change) {
+        is DartLspTextDocumentEdit -> {
+          val uri = change.textDocument.uri
+          val virtualFile = getDartFileInfo(project, uri).findFile() ?: return false
+          val document = FileDocumentManager.getInstance().getDocument(virtualFile) ?: return false
+          if (!applyTextEdits(document, change.edits)) return false
+        }
+        else -> {
+          LOG.warn("Unsupported document change type: ${change::class.java.simpleName}")
+          return false
+        }
+      }
     }
     return true
   }

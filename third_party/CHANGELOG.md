@@ -1,16 +1,45 @@
 ## Unreleased
 
 ### Added
-- Populate Dart Analysis tool window errors and warnings using Language Server Protocol (LSP) publishDiagnostics notifications (#520)
-- Go to Type Declaration implemented with JetBrains LSP (#615)
-- Type and Call Hierarchy navigation implemented with JetBrains LSP (#403)
-- Find Usages / references with JetBrains LSP (experimental feature) (#396).
+- File Structure view implemented with JetBrains LSP (experimental feature) (#673)
+- Code completion with JetBrains LSP (experimental feature) (#399)
+- Support for the Dart "parts with imports" language feature in IDE-side resolution used by Override/Implement Methods, Generate actions, and parameter info: imports in part files and nested parts ([dart-lang/sdk#56209](https://github.com/dart-lang/sdk/issues/56209)) (#721)
 
 ### Changed
-- Diagnostics server port retrieval via LSP has passed the experimental phase and is now enabled for all users with an appropriate SDK
-- Hover via LSP is now enabled for all users (#626)
 
 ### Removed
+
+### Fixed
+- Avoid UI freeze in Highlight Usages in File when waiting for LSP document highlights (#720)
+
+## 510.0.0
+
+### Added
+- Inlay hints for types and parameter names, configurable in Settings | Editor | Inlay Hints (JetBrains LSP; requires Dart SDK 3.14.0-139.0.dev or newer) (#617)
+- Per-category options for the Dart inlay hints in Settings | Editor | Inlay Hints (JetBrains LSP; requires Dart SDK 3.14.0-258.0.dev or newer) (#679)
+- Updating Dart imports when renaming or moving files and directories via LSP `workspace/willRenameFiles` (experimental feature) (#638)
+- Closing labels populated using Language Server Protocol (LSP) publishClosingLabels notifications (experimental feature; requires Dart SDK 3.14.0-219.0.dev or newer) (#400)
+- Quick fixes, assists, source actions, and refactorings via LSP code actions (experimental feature; requires Dart SDK 3.14.0-137.0.dev or newer) (#526)
+
+### Changed
+- Highlighting read vs write variable occurrences via LSP is now enabled for all users (#693)
+
+### Fixed
+- Support lsp4j 1.0.0 in IntelliJ 2026.3 (#671)
+- Avoid ambiguous "Find Usages Of" popup when invoking Find Usages with LSP references enabled (#643)
+- Class and method grouping for LSP Find Usages (#650)
+
+## 509.0.0
+
+### Added
+- Populating Dart Analysis tool window errors and warnings using Language Server Protocol (LSP) publishDiagnostics notifications (#520)
+- Go to Type Declaration implemented with JetBrains LSP (#615)
+- Type and Call Hierarchy navigation implemented with JetBrains LSP (#403)
+- Find Usages / references with JetBrains LSP (experimental feature) (#396)
+
+### Changed
+- Diagnostics server port retrieval via LSP has passed the experimental phase and is now enabled for all users with an appropriate SDK (#625)
+- Hover via LSP is now enabled for all users (#626)
 
 ### Fixed
 - Quick Documentation from code completion popup window (#632)

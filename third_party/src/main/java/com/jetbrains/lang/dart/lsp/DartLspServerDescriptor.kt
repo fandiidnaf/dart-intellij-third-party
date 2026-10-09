@@ -5,6 +5,7 @@
  */
 package com.jetbrains.lang.dart.lsp
 
+import com.intellij.icons.AllIcons
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.io.OSAgnosticPathUtil
 import com.intellij.openapi.vfs.VfsUtil
@@ -16,18 +17,27 @@ import com.intellij.platform.dartlsp.api.ProjectWideLspServerDescriptor
 import com.intellij.platform.dartlsp.api.customization.LspCallHierarchyCustomizer
 import com.intellij.platform.dartlsp.api.customization.LspCallHierarchyDisabled
 import com.intellij.platform.dartlsp.api.customization.LspCallHierarchySupport
+import com.intellij.platform.dartlsp.api.customization.LspCodeActionsCustomizer
 import com.intellij.platform.dartlsp.api.customization.LspCodeActionsDisabled
+import com.intellij.platform.dartlsp.api.customization.LspCodeActionsSupport
 import com.intellij.platform.dartlsp.api.customization.LspCodeLensDisabled
+import com.intellij.platform.dartlsp.api.customization.LspCommandsCustomizer
 import com.intellij.platform.dartlsp.api.customization.LspCommandsDisabled
+import com.intellij.platform.dartlsp.api.customization.LspCommandsSupport
+import com.intellij.platform.dartlsp.api.customization.LspCompletionCustomizer
 import com.intellij.platform.dartlsp.api.customization.LspCompletionDisabled
+import com.intellij.platform.dartlsp.api.customization.LspCompletionSupport
 import com.intellij.platform.dartlsp.api.customization.LspCustomization
+import com.intellij.platform.dartlsp.api.customization.LspDiagnosticsCustomizer
 import com.intellij.platform.dartlsp.api.customization.LspDiagnosticsDisabled
+import com.intellij.platform.dartlsp.api.customization.LspDiagnosticsSupport
 import com.intellij.platform.dartlsp.api.customization.LspDocumentColorDisabled
 import com.intellij.platform.dartlsp.api.customization.LspDocumentHighlightsCustomizer
-import com.intellij.platform.dartlsp.api.customization.LspDocumentHighlightsDisabled
 import com.intellij.platform.dartlsp.api.customization.LspDocumentHighlightsSupport
 import com.intellij.platform.dartlsp.api.customization.LspDocumentLinkDisabled
+import com.intellij.platform.dartlsp.api.customization.LspDocumentSymbolCustomizer
 import com.intellij.platform.dartlsp.api.customization.LspDocumentSymbolDisabled
+import com.intellij.platform.dartlsp.api.customization.LspDocumentSymbolSupport
 import com.intellij.platform.dartlsp.api.customization.LspFindReferencesCustomizer
 import com.intellij.platform.dartlsp.api.customization.LspFindReferencesDisabled
 import com.intellij.platform.dartlsp.api.customization.LspFindReferencesSupport
@@ -38,6 +48,7 @@ import com.intellij.platform.dartlsp.api.customization.LspGoToDefinitionDisabled
 import com.intellij.platform.dartlsp.api.customization.LspGoToDefinitionSupport
 import com.intellij.platform.dartlsp.api.customization.LspGoToTypeDefinitionSupport
 import com.intellij.platform.dartlsp.api.customization.LspHoverSupport
+import com.intellij.platform.dartlsp.api.customization.LspInlayHintCustomizer
 import com.intellij.platform.dartlsp.api.customization.LspInlayHintDisabled
 import com.intellij.platform.dartlsp.api.customization.LspOptimizeImportsDisabled
 import com.intellij.platform.dartlsp.api.customization.LspRenameDisabled
@@ -52,6 +63,9 @@ import com.intellij.psi.PsiFile
 import com.intellij.util.io.URLUtil
 import com.jetbrains.lang.dart.analyzer.DartAnalysisServerService
 import com.jetbrains.lang.dart.sdk.DartConfigurable
+import org.eclipse.lsp4j.CompletionItem
+import org.eclipse.lsp4j.CompletionItemKind
+import javax.swing.Icon
 
 /**
  * Configuration descriptor that defines how the JetBrains LSP client communicates with the Dart Bridge server.
@@ -115,11 +129,31 @@ class DartLspServerDescriptor(project: Project) : ProjectWideLspServerDescriptor
                 LspGoToDefinitionDisabled
             }
         override val goToTypeDefinitionCustomizer = LspGoToTypeDefinitionSupport()
-        override val completionCustomizer = LspCompletionDisabled
+        override val completionCustomizer: LspCompletionCustomizer
+            get() = if (DartAnalysisServerService.isLspCompletionEnabled(project)) {
+                DartLspCompletionSupport
+            } else {
+                LspCompletionDisabled
+            }
         override val semanticTokensCustomizer = LspSemanticTokensDisabled
-        override val diagnosticsCustomizer = LspDiagnosticsDisabled
-        override val codeActionsCustomizer = LspCodeActionsDisabled
-        override val commandsCustomizer = LspCommandsDisabled
+        override val diagnosticsCustomizer: LspDiagnosticsCustomizer
+            get() = if (DartAnalysisServerService.isLspPublishDiagnosticsEnabled(project)) {
+                LspDiagnosticsSupport()
+            } else {
+                LspDiagnosticsDisabled
+            }
+        override val codeActionsCustomizer: LspCodeActionsCustomizer
+            get() = if (DartConfigurable.isLspCodeActionsEnabled(project)) {
+                LspCodeActionsSupport()
+            } else {
+                LspCodeActionsDisabled
+            }
+        override val commandsCustomizer: LspCommandsCustomizer
+            get() = if (DartConfigurable.isLspCodeActionsEnabled(project)) {
+                LspCommandsSupport()
+            } else {
+                LspCommandsDisabled
+            }
         override val formattingCustomizer = LspFormattingDisabled
         override val findReferencesCustomizer: LspFindReferencesCustomizer
             get() = if (DartAnalysisServerService.isLspReferencesEnabled(project)) {
@@ -131,18 +165,24 @@ class DartLspServerDescriptor(project: Project) : ProjectWideLspServerDescriptor
         override val documentColorCustomizer = LspDocumentColorDisabled
         override val documentLinkCustomizer = LspDocumentLinkDisabled
         override val foldingRangeCustomizer = LspFoldingRangeDisabled
-        override val inlayHintCustomizer = LspInlayHintDisabled
-        override val documentHighlightsCustomizer: LspDocumentHighlightsCustomizer
-            get() = if (DartConfigurable.isExperimentalLspFeaturesEnabled(project)) {
-                object : LspDocumentHighlightsSupport() {
-                    // The default implementation only serves plain-text/TextMate files.
-                    override fun shouldAskServerForDocumentHighlights(psiFile: PsiFile): Boolean = true
-                }
+        override val inlayHintCustomizer: LspInlayHintCustomizer
+            get() = if (DartAnalysisServerService.isLspInlayHintsEnabled(project)) {
+                DartLspInlayHintSupport(project)
             } else {
-                LspDocumentHighlightsDisabled
+                LspInlayHintDisabled
+            }
+        override val documentHighlightsCustomizer: LspDocumentHighlightsCustomizer =
+            object : LspDocumentHighlightsSupport() {
+                // The default implementation only serves plain-text/TextMate files.
+                override fun shouldAskServerForDocumentHighlights(psiFile: PsiFile): Boolean = true
             }
         override val signatureHelpCustomizer = LspSignatureHelpDisabled
-        override val documentSymbolCustomizer = LspDocumentSymbolDisabled
+        override val documentSymbolCustomizer: LspDocumentSymbolCustomizer
+            get() = if (DartConfigurable.isExperimentalLspFeaturesEnabled(project)) {
+                LspDocumentSymbolSupport()
+            } else {
+                LspDocumentSymbolDisabled
+            }
         override val workspaceSymbolCustomizer = LspWorkspaceSymbolDisabled
         override val callHierarchyCustomizer: LspCallHierarchyCustomizer
             get() = if (DartConfigurable.isExperimentalLspFeaturesEnabled(project)) {
@@ -160,5 +200,13 @@ class DartLspServerDescriptor(project: Project) : ProjectWideLspServerDescriptor
         override val selectionRangeCustomizer = LspSelectionRangeDisabled
         override val codeLensCustomizer = LspCodeLensDisabled
         override val renameCustomizer = LspRenameDisabled
+    }
+}
+
+object DartLspCompletionSupport : LspCompletionSupport() {
+    public override fun getIcon(item: CompletionItem): Icon? = when (item.kind) {
+        CompletionItemKind.Constructor -> AllIcons.Nodes.ClassInitializer
+        CompletionItemKind.Function -> AllIcons.Nodes.Lambda
+        else -> super.getIcon(item)
     }
 }

@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 jobs:
-  # Job 0: Check Agent Skills Documentation
-  check-skills-docs:
+  # Job 0: Check AI Configuration and Agent Skills
+  check-ai-config:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -21,8 +21,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Run documentation check
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+      - name: Check agent skills documentation
         run: ./tool/check_agent_skills.sh
+      - name: Lint agent skills
+        run: ./tool/validate_skills.sh
+      - name: Check AI ignore configurations
+        run: ./tool/check_ai_config.sh
 
   # Job 1: Build Plugin
   build-plugin:
@@ -34,13 +40,13 @@ jobs:
           persist-credentials: false
 
       - name: Set up JDK
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
           distribution: 'temurin' # Recommended distribution
           java-version: '21' # Match version in build.gradle.kts
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
 
       - name: Build Plugin Action
         run: ./gradlew buildPlugin
@@ -60,13 +66,13 @@ jobs:
           persist-credentials: false
 
       - name: Set up JDK
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
           distribution: 'temurin' # Recommended distribution
           java-version: '21' # Match version in build.gradle.kts
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
 
       - name: Provision Dart SDK
         run: ../tool/provision_dart.sh
@@ -123,72 +129,49 @@ jobs:
           df -h
 
       - name: Set up JDK
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
           distribution: 'temurin' # Recommended distribution
           java-version: '21' # Match version in build.gradle.kts
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
 
+      # `verifyPlugin` gates on severity via `failureLevel` in build.gradle.kts.
+      # The steps below use `!cancelled()` so that a failure in one verification
+      # still reports the others, and so that "Check baselines" always runs to
+      # explain *which* issues are new -- that diagnosis is the whole point, and
+      # it used to be skipped precisely when the verifier failed.
       - name: Verify Plugin Actions
-        run: |
-          ./gradlew verifyPlugin
-          ./gradlew verifyPluginProjectConfiguration
-          ./gradlew verifyPluginSignature
-          ./gradlew verifyPluginStructure
+        run: ./gradlew verifyPlugin
         working-directory: third_party
+
+      - name: Verify Plugin Project Configuration
+        if: ${{ !cancelled() }}
+        run: ./gradlew verifyPluginProjectConfiguration
+        working-directory: third_party
+
+      - name: Verify Plugin Signature
+        if: ${{ !cancelled() }}
+        run: ./gradlew verifyPluginSignature
+        working-directory: third_party
+
+      - name: Verify Plugin Structure
+        if: ${{ !cancelled() }}
+        run: ./gradlew verifyPluginStructure
+        working-directory: third_party
+
       - name: Upload verifier results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
+        if: ${{ !cancelled() }}
         with:
           name: build
           path: |
             **/build/reports/
             **/build/test-results/
+
+      # Diffs every report produced above against tool/baseline/<IDE branch>/.
+      # New problems are surfaced as job annotations and in the job summary.
       - name: Check baselines
-        run: |
-          
-          RED='\033[0;31m'
-          GREEN='\033[0;32m'
-          YELLOW='\033[1;33m'
-          BOLD='\033[1m'
-          NC='\033[0m' # None (Reset)
-
-          EXIT_STATUS=0
-          for version in 253 261 262; do
-            echo -e "${BOLD}Checking baseline for $version...${NC}"
-            BASELINE="third_party/tool/baseline/$version/verifier-baseline.txt"
-            REPORT=$(find third_party/build/reports/pluginVerifier -path "*-$version.*/report.md" | head -n 1)
-            echo "Found report: $REPORT"
-
-            if [ -f "$REPORT" ]; then
-              echo "Comparing baseline against report in $REPORT"
-              grep "^*" "$REPORT" | grep -v "com\.intellij\.platform\.dartlsp" | sort > current_issues.tmp || true
-
-              if [ -f "$BASELINE" ]; then
-                NEW_ERRORS=$(comm -13 <(sort "$BASELINE") current_issues.tmp)
-
-                if [ -n "$NEW_ERRORS" ]; then
-                  echo -e "${RED}${BOLD}Error: New verification issues found for version $version:${NC}"
-                  echo "$NEW_ERRORS"
-                  EXIT_STATUS=1
-                else
-                  echo -e "${GREEN}Verification passed for version $version (no new issues).${NC}"
-                fi
-              else
-                echo -e "${YELLOW}Warning: No baseline file found at $BASELINE. Skipping comparison.${NC}"
-              fi
-            else
-              echo -e "${RED}${BOLD}Error: Report does not exist.${NC}"
-              EXIT_STATUS=1
-            fi
-          done
-
-          if [ $EXIT_STATUS -ne 0 ]; then
-            echo -e "${RED}${BOLD}Build failed: New verification issues were detected.${NC}"
-            echo -e "${YELLOW}To update the baselines with these new issues, run:${NC}"
-            echo -e "${YELLOW}  ./third_party/tool/update_baselines.sh${NC}"
-            echo -e "${YELLOW}from the repository root and commit the changes.${NC}"
-            exit 1
-          fi
+        if: ${{ !cancelled() }}
+        run: ./third_party/tool/check_verifier_baselines.sh check

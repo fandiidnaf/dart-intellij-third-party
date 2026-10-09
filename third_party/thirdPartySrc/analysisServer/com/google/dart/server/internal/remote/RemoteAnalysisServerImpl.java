@@ -13,6 +13,7 @@
  */
 package com.google.dart.server.internal.remote;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.dart.server.AnalysisServerListener;
 import com.google.dart.server.AnalysisServerSocket;
 import com.google.dart.server.AnalysisServerStatusListener;
@@ -22,6 +23,7 @@ import com.google.dart.server.Consumer;
 import com.google.dart.server.CreateContextConsumer;
 import com.google.dart.server.DartLspTextDocumentContentConsumer;
 import com.google.dart.server.DartLspWorkspaceApplyEditRequestConsumer;
+import com.google.dart.server.DartLspWorkspaceConfigurationConsumer;
 import com.google.dart.server.FindElementReferencesConsumer;
 import com.google.dart.server.FindMemberDeclarationsConsumer;
 import com.google.dart.server.FindMemberReferencesConsumer;
@@ -125,14 +127,18 @@ import com.google.dart.server.utilities.instrumentation.InstrumentationBuilder;
 import com.google.dart.server.utilities.logging.Logging;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
 import org.dartlang.analysis.server.protocol.AnalysisOptions;
 import org.dartlang.analysis.server.protocol.DartLspApplyWorkspaceEditParams;
 import org.dartlang.analysis.server.protocol.DartLspApplyWorkspaceEditResult;
+import org.dartlang.analysis.server.protocol.DartLspDocumentChange;
 import org.dartlang.analysis.server.protocol.DartLspPosition;
 import org.dartlang.analysis.server.protocol.DartLspRange;
+import org.dartlang.analysis.server.protocol.DartLspTextDocumentEdit;
 import org.dartlang.analysis.server.protocol.DartLspTextEdit;
+import org.dartlang.analysis.server.protocol.DartLspVersionedTextDocumentIdentifier;
 import org.dartlang.analysis.server.protocol.DartLspWorkspaceEdit;
 import org.dartlang.analysis.server.protocol.FlutterWidgetPropertyValue;
 import org.dartlang.analysis.server.protocol.ImportedElements;
@@ -151,6 +157,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -908,10 +915,12 @@ public abstract class RemoteAnalysisServerImpl implements AnalysisServer {
   }
 
   private void processLspRequestFromServer(String dasRequestId, JsonObject lspMessage) {
-    String lspRequestId = lspMessage.get("id").getAsString();
     String lspMethod = lspMessage.get("method").getAsString();
     if (lspMethod.equals("workspace/applyEdit")) {
-      processWorspaceApplyEditRequestFromServer(dasRequestId, lspRequestId, lspMessage.get("params"));
+      processWorspaceApplyEditRequestFromServer(dasRequestId, lspMessage.get("id"), lspMessage.get("params"));
+    }
+    else if (lspMethod.equals("workspace/configuration")) {
+      processWorkspaceConfigurationRequestFromServer(dasRequestId, lspMessage.get("id"), lspMessage.get("params"));
     }
   }
 
@@ -950,7 +959,7 @@ public abstract class RemoteAnalysisServerImpl implements AnalysisServer {
       }
     }
   */
-  private void processWorspaceApplyEditRequestFromServer(String dasRequestId, String lspRequestId, JsonElement paramsElement) {
+  private void processWorspaceApplyEditRequestFromServer(String dasRequestId, JsonElement lspRequestId, JsonElement paramsElement) {
     DartLspApplyWorkspaceEditParams workspaceEditParams = getAsWorkspaceEditParams(paramsElement);
     if (workspaceEditParams == null) return;
 
@@ -960,23 +969,86 @@ public abstract class RemoteAnalysisServerImpl implements AnalysisServer {
         JsonObject lspResultElement = new JsonObject();
         lspResultElement.addProperty("applied", result.getApplied());
 
-        JsonObject lspResponseElement = new JsonObject();
-        lspResponseElement.addProperty("id", lspRequestId);
-        lspResponseElement.addProperty("jsonrpc", "2.0");
-        lspResponseElement.add("result", lspResultElement);
-
-        JsonObject resultJsonElement = new JsonObject();
-        resultJsonElement.add("lspResponse", lspResponseElement);
-
-        JsonObject responseElement = new JsonObject();
-        responseElement.addProperty("id", dasRequestId);
-        responseElement.add("result", resultJsonElement);
-
-        sendResponseToServer(responseElement);
+        // The id is echoed as the server sent it: it may be a number or a string, and a number
+        // that came back as a string would not match the request the server is waiting for.
+        sendResponseToServer(RequestUtilities.generateLSPResponse(dasRequestId, lspRequestId, lspResultElement));
       }
     };
 
     lsp_workspaceApplyEdit(workspaceEditParams, consumer);
+  }
+
+  /*
+    {
+      "id": "1",
+      "method": "lsp.handle",
+      "params": {
+        "lspMessage": {
+          "id": 0,
+          "jsonrpc": "2.0",
+          "method": "workspace/configuration",
+          "params": {
+            "items": [
+              {
+                "section": "dart"
+              }
+            ]
+          }
+        }
+      }
+    }
+
+    The server blocks its initialization until it gets an answer, so this request must always be
+    answered, even if none of the requested sections is known.
+  */
+  private void processWorkspaceConfigurationRequestFromServer(String dasRequestId, JsonElement lspRequestId, JsonElement paramsElement) {
+    List<String> sections = getAsConfigurationSections(paramsElement);
+
+    AtomicBoolean answered = new AtomicBoolean(false);
+    DartLspWorkspaceConfigurationConsumer consumer = new DartLspWorkspaceConfigurationConsumer() {
+      @Override
+      public void computedConfiguration(List<JsonObject> configurations) {
+        // The server matches its request by the id, so it must not be answered more than once.
+        if (!answered.compareAndSet(false, true)) return;
+
+        // The LSP protocol expects exactly one result per requested section, in the same order.
+        JsonArray lspResultElement = new JsonArray();
+        for (int i = 0; i < sections.size(); i++) {
+          JsonObject configuration = configurations != null && i < configurations.size() ? configurations.get(i) : null;
+          lspResultElement.add(configuration != null ? configuration : JsonNull.INSTANCE);
+        }
+
+        sendResponseToServer(RequestUtilities.generateLSPResponse(dasRequestId, lspRequestId, lspResultElement));
+      }
+    };
+
+    try {
+      lsp_workspaceConfiguration(sections, consumer);
+    }
+    catch (Throwable e) {
+      // A request that is never answered blocks the initialization of the server, so fall back to
+      // an all-null result, which makes the server use its default configuration. This catches
+      // Throwable, not only RuntimeException, because the reader loop swallows Errors (such as a
+      // NoClassDefFoundError while the plugin is being unloaded) as well, which would otherwise
+      // leave the request unanswered too. Answer before logging: the logger of the client may
+      // rethrow the exception, and the answer must be out by then.
+      consumer.computedConfiguration(null);
+      Logging.getLogger().logError("Error while answering the workspace/configuration request", e);
+    }
+  }
+
+  private List<String> getAsConfigurationSections(JsonElement paramsElement) {
+    List<String> sections = new ArrayList<>();
+    if (!(paramsElement instanceof JsonObject)) return sections;
+
+    JsonElement itemsElement = ((JsonObject)paramsElement).get("items");
+    if (!(itemsElement instanceof JsonArray)) return sections;
+
+    for (JsonElement itemElement : itemsElement.getAsJsonArray()) {
+      JsonElement sectionElement = itemElement instanceof JsonObject ? ((JsonObject)itemElement).get("section") : null;
+      sections.add(sectionElement instanceof JsonPrimitive ? sectionElement.getAsString() : null);
+    }
+    return sections;
   }
 
   private @Nullable DartLspApplyWorkspaceEditParams getAsWorkspaceEditParams(JsonElement paramsElement) {
@@ -986,30 +1058,33 @@ public abstract class RemoteAnalysisServerImpl implements AnalysisServer {
     JsonElement editElement = paramsElement.getAsJsonObject().get("edit");
     if (!(editElement instanceof JsonObject)) return null;
 
-    JsonElement changesElement = editElement.getAsJsonObject().get("changes");
-    if (!(changesElement instanceof JsonObject)) return null;
+    JsonElement documentChangesElement = editElement.getAsJsonObject().get("documentChanges");
+    if (!(documentChangesElement instanceof JsonArray)) return null;
 
-    Map<String, List<DartLspTextEdit>> uriToTextEditMap = new LinkedHashMap<>();
-
-    for (Map.Entry<String, JsonElement> entry : changesElement.getAsJsonObject().entrySet()) {
-      String uri = entry.getKey();
-      JsonElement editsElement = entry.getValue();
-      if (!(editsElement instanceof JsonArray)) continue;
-
-      List<DartLspTextEdit> textEdits = new ArrayList<>();
-      for (JsonElement element : editsElement.getAsJsonArray()) {
-        String newText = element.getAsJsonObject().get("newText").getAsString();
-        DartLspRange range = getAsRange(element.getAsJsonObject().get("range"));
-        textEdits.add(new DartLspTextEdit(range, newText));
+    List<DartLspDocumentChange> documentChangesList = new ArrayList<>();
+    for (JsonElement element : documentChangesElement.getAsJsonArray()) {
+      if (!element.isJsonObject()) continue;
+      JsonObject docChangeObj = element.getAsJsonObject();
+      if (docChangeObj.has("textDocument") && docChangeObj.has("edits")) {
+        JsonObject textDoc = docChangeObj.getAsJsonObject("textDocument");
+        String uri = textDoc.get("uri").getAsString();
+        Integer version = textDoc.has("version") && !textDoc.get("version").isJsonNull() ? textDoc.get("version").getAsInt() : null;
+        DartLspVersionedTextDocumentIdentifier versionedId = new DartLspVersionedTextDocumentIdentifier(uri, version);
+        List<DartLspTextEdit> textEdits = new ArrayList<>();
+        JsonElement editsElement = docChangeObj.get("edits");
+        if (editsElement instanceof JsonArray) {
+          for (JsonElement editItem : editsElement.getAsJsonArray()) {
+            String newText = editItem.getAsJsonObject().get("newText").getAsString();
+            DartLspRange range = getAsRange(editItem.getAsJsonObject().get("range"));
+            textEdits.add(new DartLspTextEdit(range, newText));
+          }
+        }
+        documentChangesList.add(new DartLspTextDocumentEdit(versionedId, textEdits));
       }
-
-      uriToTextEditMap.put(uri, textEdits);
     }
 
-    DartLspWorkspaceEdit workspaceEdit = new DartLspWorkspaceEdit(uriToTextEditMap, null);
-    DartLspApplyWorkspaceEditParams workspaceEditParams = new DartLspApplyWorkspaceEditParams(workspaceEdit, label);
-
-    return workspaceEditParams;
+    DartLspWorkspaceEdit workspaceEdit = new DartLspWorkspaceEdit(null, documentChangesList);
+    return new DartLspApplyWorkspaceEditParams(workspaceEdit, label);
   }
 
   private DartLspRange getAsRange(JsonElement rangeElement) {
@@ -1024,7 +1099,8 @@ public abstract class RemoteAnalysisServerImpl implements AnalysisServer {
     return new DartLspPosition(line, character);
   }
 
-  private void processResponse(JsonObject response) throws Exception {
+  @VisibleForTesting
+  protected void processResponse(JsonObject response) throws Exception {
     notifyResponseListeners(response);
     // handle notification
     if (processNotification(response)) {
@@ -1237,6 +1313,24 @@ public abstract class RemoteAnalysisServerImpl implements AnalysisServer {
     lastRequestTime.set(System.currentTimeMillis());
     synchronized (requestSinkLock) {
       requestSink.add(request);
+    }
+  }
+
+  /**
+   * Sends a notification, i.e. a message that the server never answers, so unlike a request it is
+   * not associated with a {@link Consumer}.
+   * <p>
+   * The request listeners see it like a request: they are notified of everything this client
+   * sends, which includes the notifications, i.e. messages that carry neither an {@code id} nor a
+   * {@code method} at the top level.
+   *
+   * @param notification the notification to send
+   */
+  public void sendNotificationToServer(JsonObject notification) {
+    notifyRequestListeners(notification);
+    lastRequestTime.set(System.currentTimeMillis());
+    synchronized (requestSinkLock) {
+      requestSink.add(notification);
     }
   }
 

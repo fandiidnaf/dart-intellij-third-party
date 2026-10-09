@@ -130,13 +130,15 @@ These skills are located in the [.agents/skills/](.agents/skills/) directory. Th
 
 ### Available Workspace Skills:
 * **[Code Review](.agents/skills/code-review/SKILL.md):** Performs a pedantic, multi-perspective code review (covering logic, correctness, resource safety, design, and styleguide compliance) on your uncommitted changes.
+* **[Dependabot PR Review](.agents/skills/dependabot-pr-review/SKILL.md):** Lists open Dependabot PRs in the Dart and Flutter IntelliJ plugins with their build status, then approves the ones you confirm and applies the `autosubmit` label.
 * **[Implement Dart Language Feature](.agents/skills/implement-dart-language-feature/SKILL.md):** Guidelines for implementing and reviewing new Dart language features, parsing logic, and grammar modifications.
+* **[Load Repository Context](.agents/skills/load-repo-context/SKILL.md):** Primes understanding of repository architecture by navigating hierarchical ABOUT.md manifests.
 * **[Migrate DAS to LSP](.agents/skills/migrate-das-to-lsp/SKILL.md):** Guide for converting legacy Dart Analysis Server (DAS) feature implementations to JetBrains LSP in the Dart IntelliJ plugin.
 * **[Monthly Release](.agents/skills/monthly-release/SKILL.md):** Step-by-step guide for preparing, validating, testing, and publishing monthly releases of the Dart IntelliJ plugin.
 * **[Patch Copied LSP Sources](.agents/skills/patch-copied-lsp-sources/SKILL.md):** Automates copying and patching of JetBrains LSP sources.
-* **[Plugin Issue Triage](.agents/skills/plugin-issue-triage/SKILL.md):** (Experimental) Automates the triage of GitHub issues in the Dart and Flutter IntelliJ plugins.
 * **[Port PR](.agents/skills/port-pr/SKILL.md):** Fetches a Pull Request from either the dart-intellij-third-party or flutter-intellij repository and conceptually ports its changes to the other repository.
 * **[Root Cause Regression](.agents/skills/root-cause-regression/SKILL.md):** Investigates a GitHub issue reporting a regression, analyzes recent commits, and identifies possible culprits.
+* **[Sync VM Service Drivers](.agents/skills/sync-vm-service-drivers/SKILL.md):** Advances the generated VM Service Java drivers one protocol version at a time with a user-reviewed, test-first workflow.
 
 ### How to use:
 Tell your AI assistant to run the desired skill (e.g. by typing `/code-review` or asking *"Run the code-review skill on my changes"*). The agent will automatically find, load, and follow the instructions in the corresponding `SKILL.md` file.
