@@ -6,9 +6,10 @@
 package com.jetbrains.lang.dart.lsp
 
 import com.google.dart.server.AnalysisServerSocket
+import com.google.dart.server.GetTypeHierarchyConsumer
 import com.google.dart.server.Consumer
 import com.google.dart.server.DartLspWorkspaceApplyEditRequestConsumer
-import com.google.dart.server.DartLspWorkspaceConfigurationConsumer
+import com.google.dart.server.JsonConsumer
 import com.google.dart.server.ResponseListener
 import com.google.dart.server.ShowMessageRequestConsumer
 import com.google.dart.server.internal.remote.ByteLineReaderStream
@@ -16,16 +17,34 @@ import com.google.dart.server.internal.remote.RemoteAnalysisServerImpl
 import com.google.dart.server.internal.remote.RequestSink
 import com.google.dart.server.internal.remote.ResponseStream
 import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import com.google.gson.reflect.TypeToken
 import com.intellij.icons.AllIcons
+import com.intellij.ide.util.PropertiesComponent
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.WriteAction
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.editor.EditorFactory
+import com.intellij.openapi.project.Project
+import com.intellij.platform.dartlsp.api.Lsp4jServer
+import com.intellij.platform.dartlsp.api.LspServer
+import com.intellij.platform.dartlsp.api.LspServerManager
+import com.intellij.platform.dartlsp.api.LspServerState
+import com.intellij.platform.dartlsp.api.customization.LspSignatureHelpDisabled
+import com.intellij.platform.dartlsp.api.customization.LspSignatureHelpSupport
+import com.intellij.psi.search.searches.DefinitionsScopedSearch
+import com.intellij.psi.util.PsiTreeUtil
+import com.jetbrains.lang.dart.psi.DartClass
+import com.jetbrains.lang.dart.sdk.DartConfigurable
 import com.jetbrains.lang.dart.DartCodeInsightFixtureTestCase
 import com.jetbrains.lang.dart.analyzer.DartAnalysisServerService
+import com.jetbrains.lang.dart.ide.toolingDaemon.DartToolingDaemonService
+import com.jetbrains.lang.dart.sdk.DartSdk
+import java.lang.reflect.Proxy
+import java.util.concurrent.CountDownLatch
 import org.dartlang.analysis.server.protocol.DartLspApplyWorkspaceEditParams
 import org.dartlang.analysis.server.protocol.MessageAction
+import org.dartlang.analysis.server.protocol.RequestError
 import org.eclipse.lsp4j.ApplyWorkspaceEditParams
 import org.eclipse.lsp4j.ApplyWorkspaceEditResponse
 import org.eclipse.lsp4j.CallHierarchyIncomingCallsParams
@@ -39,6 +58,8 @@ import org.eclipse.lsp4j.Command
 import org.eclipse.lsp4j.CompletionItem
 import org.eclipse.lsp4j.CompletionItemKind
 import org.eclipse.lsp4j.CompletionParams
+import org.eclipse.lsp4j.ConfigurationItem
+import org.eclipse.lsp4j.ConfigurationParams
 import org.eclipse.lsp4j.DidChangeConfigurationParams
 import org.eclipse.lsp4j.DocumentHighlightKind
 import org.eclipse.lsp4j.DocumentHighlightParams
@@ -47,6 +68,7 @@ import org.eclipse.lsp4j.ExecuteCommandParams
 import org.eclipse.lsp4j.FileRename
 import org.eclipse.lsp4j.HoverParams
 import org.eclipse.lsp4j.InitializeParams
+import org.eclipse.lsp4j.InitializeResult
 import org.eclipse.lsp4j.InlayHintKind
 import org.eclipse.lsp4j.InlayHintParams
 import org.eclipse.lsp4j.InsertTextFormat
@@ -58,7 +80,12 @@ import org.eclipse.lsp4j.Range
 import org.eclipse.lsp4j.ReferenceContext
 import org.eclipse.lsp4j.ReferenceParams
 import org.eclipse.lsp4j.RenameFilesParams
+import org.eclipse.lsp4j.SemanticTokenModifiers
+import org.eclipse.lsp4j.SemanticTokenTypes
+import org.eclipse.lsp4j.SemanticTokensLegend
+import org.eclipse.lsp4j.SemanticTokensParams
 import org.eclipse.lsp4j.ShowMessageRequestParams
+import org.eclipse.lsp4j.SignatureHelpParams
 import org.eclipse.lsp4j.SymbolKind
 import org.eclipse.lsp4j.TextDocumentIdentifier
 import org.eclipse.lsp4j.TypeDefinitionParams
@@ -70,11 +97,23 @@ import org.eclipse.lsp4j.WorkspaceEdit
 import org.eclipse.lsp4j.jsonrpc.messages.Either
 import org.eclipse.lsp4j.services.LanguageClient
 import org.eclipse.lsp4j.jsonrpc.Launcher
+import com.jetbrains.lang.dart.highlight.DartSyntaxHighlighterColors
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import org.eclipse.lsp4j.jsonrpc.MessageConsumer
+import org.eclipse.lsp4j.jsonrpc.messages.RequestMessage
+import org.eclipse.lsp4j.jsonrpc.messages.ResponseMessage
+import org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.util.concurrent.Executors
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
 
@@ -85,6 +124,10 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
     private val capturedRequests = CopyOnWriteArrayList<JsonObject>()
     private val capturedResponses = CopyOnWriteArrayList<JsonObject>()
     private val capturedNotifications = CopyOnWriteArrayList<JsonObject>()
+    private var capturedConsumer: Consumer? = null
+    @Volatile private var requestObserver: ((JsonObject) -> Unit)? = null
+    private var legacyHierarchyRequests = 0
+    private val legacyHierarchyArguments = CopyOnWriteArrayList<Triple<String, Int, Boolean>>()
 
     override fun setUp() {
         super.setUp()
@@ -109,16 +152,25 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
                 super.addResponseListener(listener)
             }
             
+            override fun search_getTypeHierarchy(file: String, offset: Int, superOnly: Boolean, consumer: GetTypeHierarchyConsumer) {
+                legacyHierarchyRequests++
+                legacyHierarchyArguments.add(Triple(file, offset, superOnly))
+                consumer.computedHierarchy(emptyList())
+            }
+
             override fun generateUniqueId(): String = "123"
 
             override fun isSocketOpen(): Boolean = true
 
             override fun sendRequestToServer(id: String, request: JsonObject) {
                 capturedRequests.add(request)
+                requestObserver?.invoke(request)
             }
 
             override fun sendRequestToServer(id: String, request: JsonObject, consumer: Consumer) {
                 capturedRequests.add(request)
+                capturedConsumer = consumer
+                requestObserver?.invoke(request)
             }
 
             override fun sendResponseToServer(response: JsonObject) {
@@ -141,11 +193,6 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
             override fun lsp_workspaceApplyEdit(
                 params: DartLspApplyWorkspaceEditParams?,
                 consumer: DartLspWorkspaceApplyEditRequestConsumer?
-            ) {}
-
-            override fun lsp_workspaceConfiguration(
-                sections: MutableList<String?>?,
-                consumer: DartLspWorkspaceConfigurationConsumer?
             ) {}
         }
 
@@ -171,6 +218,8 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
             
             capturedRequests.clear()
             capturedNotifications.clear()
+            capturedResponses.clear()
+            capturedConsumer = null
         } finally {
             super.tearDown()
         }
@@ -374,6 +423,242 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
         val result = future.get(5, TimeUnit.SECONDS)
         assertNotNull(result)
         assertEquals(9123, result.port)
+    }
+
+    fun testConnectToDtdRequest() {
+        val dtdUri = "ws://127.0.0.1:9124/secret"
+        val future = bridgeServer.connectToDtd(ConnectToDtdParams(dtdUri))
+
+        val jsonObject = capturedRequests.find { it.get("method")?.asString == "lsp.handle" }
+        assertNotNull("An lsp.handle request should be sent to DAS", jsonObject)
+        assertEquals("123", jsonObject!!.get("id").asString)
+
+        val outerParams = jsonObject.getAsJsonObject("params")
+        val lspMessage = outerParams.getAsJsonObject("lspMessage")
+        assertEquals("123", lspMessage.get("id").asString)
+        assertEquals("dart/connectToDtd", lspMessage.get("method").asString)
+        val params = lspMessage.getAsJsonObject("params")
+        assertNotNull("lspMessage should include params with uri", params)
+        assertEquals(dtdUri, params.get("uri").asString)
+
+        val responseJson = """
+            {
+              "id": "123",
+              "result": {
+                "lspResponse": {
+                  "jsonrpc": "2.0",
+                  "id": "123",
+                  "result": null
+                }
+              }
+            }
+        """.trimIndent()
+
+        capturedListener.onResponse(responseJson)
+
+        assertNull(future.get(5, TimeUnit.SECONDS))
+    }
+
+    fun testDescriptorLspServerListenerDoesNotEagerlyCreateDtdService() {
+        var getServiceIfCreatedCalled = false
+        var getServiceCalled = false
+        val mockProject = Proxy.newProxyInstance(
+            Project::class.java.classLoader,
+            arrayOf(Project::class.java)
+        ) { _, method, args ->
+            if (args?.firstOrNull() == DartToolingDaemonService::class.java) {
+                when (method.name) {
+                    "getServiceIfCreated" -> {
+                        getServiceIfCreatedCalled = true
+                        return@newProxyInstance null
+                    }
+                    "getService" -> {
+                        getServiceCalled = true
+                        return@newProxyInstance null
+                    }
+                }
+            }
+            if (args == null) method.invoke(project) else method.invoke(project, *args)
+        } as Project
+
+        val descriptor = DartLspServerDescriptor(mockProject)
+        val listener = descriptor.lspServerListener
+        assertNotNull("DartLspServerDescriptor should provide an LspServerListener", listener)
+
+        listener.serverInitialized(InitializeResult())
+
+        assertTrue(
+            "serverInitialized should query DartToolingDaemonService via getServiceIfCreated",
+            getServiceIfCreatedCalled
+        )
+        assertFalse(
+            "serverInitialized should not eagerly instantiate DartToolingDaemonService via getService",
+            getServiceCalled
+        )
+    }
+
+    fun testConnectToDtdIgnoresAlreadyConnectedStateError() {
+        val dtdUri = "ws://127.0.0.1:9124/secret"
+        val future = bridgeServer.connectToDtd(ConnectToDtdParams(dtdUri))
+
+        val responseJson = """
+            {
+              "id": "123",
+              "result": {
+                "lspResponse": {
+                  "jsonrpc": "2.0",
+                  "id": "123",
+                  "error": {
+                    "code": -32015,
+                    "message": "Server is already connected to DTD"
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        capturedListener.onResponse(responseJson)
+
+        assertNull(future.get(5, TimeUnit.SECONDS))
+
+        // Other LSP error codes (e.g. -32603 InternalError) must still complete exceptionally.
+        val otherErrorFuture = bridgeServer.connectToDtd(ConnectToDtdParams(dtdUri))
+        val otherErrorJson = """
+            {
+              "id": "123",
+              "result": {
+                "lspResponse": {
+                  "jsonrpc": "2.0",
+                  "id": "123",
+                  "error": {
+                    "code": -32603,
+                    "message": "Failed to connect to DTD"
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        capturedListener.onResponse(otherErrorJson)
+
+        try {
+            otherErrorFuture.get(5, TimeUnit.SECONDS)
+            fail("Expected non--32015 error to complete connectToDtd exceptionally")
+        } catch (expected: ExecutionException) {
+            assertTrue(expected.cause?.message?.contains("Failed to connect to DTD") == true)
+        }
+    }
+
+    fun testDescriptorLspServerListenerConnectsWhenDtdIsRunning() {
+        val dtdUri = "ws://127.0.0.1:9125/secret"
+        val dtdService = DartToolingDaemonService.getInstance(project)
+        val uriField = DartToolingDaemonService::class.java.getDeclaredField("uri").apply { isAccessible = true }
+        val sdk = DartSdk.getDartSdk(project)!!
+        val versionField = DartSdk::class.java.getDeclaredField("myVersion").apply { isAccessible = true }
+        val originalVersion = sdk.version
+
+        val requestSentLatch = CountDownLatch(1)
+        val skipSendRequest = AtomicBoolean(false)
+        val mockLspServer = Proxy.newProxyInstance(
+            LspServer::class.java.classLoader,
+            arrayOf(LspServer::class.java)
+        ) { proxy, method, args ->
+            when (method.name) {
+                "getState" -> LspServerState.Running
+                "sendRequestSync" -> {
+                    if (!skipSendRequest.get()) {
+                        @Suppress("UNCHECKED_CAST")
+                        val sender = args.last() as (Lsp4jServer) -> CompletableFuture<Any?>
+                        sender(bridgeServer)
+                        requestSentLatch.countDown()
+                    }
+                    null
+                }
+                "hashCode" -> System.identityHashCode(proxy)
+                "equals" -> proxy === args?.firstOrNull()
+                else -> null
+            }
+        } as LspServer
+
+        val mockLspServerManager = Proxy.newProxyInstance(
+            LspServerManager::class.java.classLoader,
+            arrayOf(LspServerManager::class.java)
+        ) { _, method, _ ->
+            if (method.name == "getServersForProvider") listOf(mockLspServer) else null
+        } as LspServerManager
+
+        val mockProject = Proxy.newProxyInstance(
+            Project::class.java.classLoader,
+            arrayOf(Project::class.java)
+        ) { _, method, args ->
+            when {
+                args?.firstOrNull() == DartToolingDaemonService::class.java && method.name == "getServiceIfCreated" -> dtdService
+                args?.firstOrNull() == LspServerManager::class.java && method.name == "getService" -> mockLspServerManager
+                args == null -> method.invoke(project)
+                else -> method.invoke(project, *args)
+            }
+        } as Project
+
+        try {
+            versionField.set(sdk, "3.8.0")
+            uriField.set(dtdService, dtdUri)
+
+            // If sendRequestSync returns null without invoking the sender lambda, the cached URI must be evicted.
+            skipSendRequest.set(true)
+            DartLspService.connectToDtd(mockProject, dtdUri).get(5, TimeUnit.SECONDS)
+            skipSendRequest.set(false)
+
+            val descriptor = DartLspServerDescriptor(mockProject)
+            descriptor.lspServerListener.serverInitialized(InitializeResult())
+
+            assertTrue("Expected dart/connectToDtd request to be sent", requestSentLatch.await(5, TimeUnit.SECONDS))
+            val connectRequests = capturedRequests.filter {
+                it.get("method")?.asString == "lsp.handle" &&
+                    it.getAsJsonObject("params")?.getAsJsonObject("lspMessage")?.get("method")?.asString == "dart/connectToDtd"
+            }
+            assertEquals(1, connectRequests.size)
+            assertEquals(
+                dtdUri,
+                connectRequests[0].getAsJsonObject("params").getAsJsonObject("lspMessage").getAsJsonObject("params").get("uri").asString
+            )
+
+            // Calling connectToDtd again for the same running LspServer and URI must not send a duplicate request.
+            DartLspService.connectToDtd(mockProject, dtdUri).get(5, TimeUnit.SECONDS)
+            val connectRequestsAfterDuplicate = capturedRequests.filter {
+                it.get("method")?.asString == "lsp.handle" &&
+                    it.getAsJsonObject("params")?.getAsJsonObject("lspMessage")?.get("method")?.asString == "dart/connectToDtd"
+            }
+            assertEquals(1, connectRequestsAfterDuplicate.size)
+
+            // If the in-flight request fails with a non--32015 error, the cached URI must be evicted so a retry succeeds.
+            val requestId = connectRequests[0].get("id").asString
+            capturedListener.onResponse(
+                """
+                {
+                  "id": "$requestId",
+                  "result": {
+                    "lspResponse": {
+                      "jsonrpc": "2.0",
+                      "id": "$requestId",
+                      "error": {
+                        "code": -32603,
+                        "message": "Transient DTD error"
+                      }
+                    }
+                  }
+                }
+                """.trimIndent()
+            )
+            DartLspService.connectToDtd(mockProject, dtdUri).get(5, TimeUnit.SECONDS)
+            val connectRequestsAfterRetry = capturedRequests.filter {
+                it.get("method")?.asString == "lsp.handle" &&
+                    it.getAsJsonObject("params")?.getAsJsonObject("lspMessage")?.get("method")?.asString == "dart/connectToDtd"
+            }
+            assertEquals(2, connectRequestsAfterRetry.size)
+        } finally {
+            uriField.set(dtdService, null)
+            versionField.set(sdk, originalVersion)
+        }
     }
 
     fun testForwardNotification() {
@@ -871,6 +1156,7 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
         val experimentalNames = LspMethod.getExperimentalFeatures().mapNotNull { it.presentableName }
         assertTrue("Experimental features list should contain 'code actions'", experimentalNames.contains("code actions"))
         assertTrue("Experimental features list should contain 'errors and warnings'", experimentalNames.contains("errors and warnings"))
+        assertTrue("Experimental features list should contain 'signature help'", experimentalNames.contains("signature help"))
         assertFalse("DOCUMENT_HIGHLIGHT should not be experimental", LspMethod.getExperimentalFeatures().contains(LspMethod.DOCUMENT_HIGHLIGHT))
     }
 
@@ -894,6 +1180,280 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
         assertTrue(completionItem.get("insertReplaceSupport").asBoolean)
         assertTrue(DartAnalysisServerService.isDartSdkVersionSufficientForLspCompletion("3.14.0-226.0.dev"))
         assertTrue(DartAnalysisServerService.isDartSdkVersionSufficientForLspCompletion("3.15.0"))
+    }
+
+    fun testInitialize_semanticTokensProvider_notAdvertisedWhenLegendNotProvided() {
+        val future = bridgeServer.initialize(InitializeParams())
+        val result = future.get(5, TimeUnit.SECONDS)
+        assertNotNull(result)
+        val capabilities = result.capabilities
+        assertNotNull(capabilities)
+        assertNull("Semantic tokens provider should not be advertised if DAS did not provide a legend", capabilities.semanticTokensProvider)
+        assertFalse(bridgeServer.isSemanticTokensAdvertised)
+        assertFalse(DartAnalysisServerService.getInstance(project).isSemanticTokensAdvertised)
+    }
+
+    fun testInitialize_semanticTokensDynamicLegendFromDas() {
+        val dasLegendTypes = listOf(
+            "annotation", "class", "comment", "method", "variable",
+            "parameter", "enum", "enumMember", "type", "source",
+            "property", "keyword", "label", "namespace", "boolean",
+            "number", "string", "function", "typeParameter"
+        )
+        val dasLegendModifiers = listOf(
+            "documentation", "constructor", "declaration", "importPrefix",
+            "instance", "static", "escape", "annotation", "control",
+            "label", "interpolation", "source", "void", "wildcard"
+        )
+        val das = DartAnalysisServerService.getInstance(project)
+        das.semanticTokensLegend = SemanticTokensLegend(dasLegendTypes, dasLegendModifiers)
+        bridgeServer.isLspHighlightingEnabled = { true }
+
+        val future = bridgeServer.initialize(InitializeParams())
+        val result = future.get(5, TimeUnit.SECONDS)
+        assertNotNull(result)
+        val legend = result.capabilities?.semanticTokensProvider?.legend
+        assertNotNull(legend)
+        assertEquals(dasLegendTypes, legend!!.tokenTypes)
+        assertEquals(dasLegendModifiers, legend.tokenModifiers)
+        assertTrue("Legend should contain standard types like 'class'", legend.tokenTypes.contains(SemanticTokenTypes.Class))
+        assertTrue("Legend should contain Dart custom type 'annotation'", legend.tokenTypes.contains("annotation"))
+        assertTrue("Legend should contain modifier 'declaration'", legend.tokenModifiers.contains(SemanticTokenModifiers.Declaration))
+        assertTrue("Legend should contain custom modifier 'constructor'", legend.tokenModifiers.contains("constructor"))
+        assertTrue(bridgeServer.isSemanticTokensAdvertised)
+        assertTrue(DartAnalysisServerService.getInstance(project).isSemanticTokensAdvertised)
+    }
+
+    fun testUpdateClientCapabilities_parsesSemanticTokensLegendFromDas() {
+        val responseJson = """
+            {
+              "lspCapabilities": {
+                "semanticTokensProvider": {
+                  "legend": {
+                    "tokenTypes": ["annotation", "class", "customType"],
+                    "tokenModifiers": ["documentation", "customModifier"]
+                  },
+                  "full": { "delta": false },
+                  "range": true
+                }
+              }
+            }
+        """.trimIndent()
+        val resultObj = JsonParser.parseString(responseJson).asJsonObject
+        val das = DartAnalysisServerService.getInstance(project)
+        das.handleClientCapabilitiesResponse(resultObj, null)
+
+        val legend = das.semanticTokensLegend
+        assertNotNull("Dynamic legend should be parsed from DAS capabilities response", legend)
+        assertEquals(listOf("annotation", "class", "customType"), legend!!.tokenTypes)
+        assertEquals(listOf("documentation", "customModifier"), legend.tokenModifiers)
+    }
+
+    fun testUpdateClientCapabilities_endToEnd() {
+        val das = DartAnalysisServerService.getInstance(project)
+        das.semanticTokensLegend = null
+
+        das.updateClientCapabilities()
+
+        val setCapsReq = capturedRequests.find { it.get("method")?.asString == "server.setClientCapabilities" }
+        assertNotNull("server.setClientCapabilities request should be sent", setCapsReq)
+        assertNotNull("Consumer should be captured", capturedConsumer)
+
+        val responseJson = """
+            {
+              "lspCapabilities": {
+                "semanticTokensProvider": {
+                  "legend": {
+                    "tokenTypes": ["class", "method", "variable"],
+                    "tokenModifiers": ["declaration", "static"]
+                  },
+                  "full": { "delta": false },
+                  "range": true
+                }
+              }
+            }
+        """.trimIndent()
+        val resultObj = JsonParser.parseString(responseJson).asJsonObject
+
+        val jsonConsumer = capturedConsumer as JsonConsumer
+        jsonConsumer.onResponse(resultObj, null)
+
+        val legend = das.semanticTokensLegend
+        assertNotNull("Dynamic legend should be set on DAS", legend)
+        assertEquals(listOf("class", "method", "variable"), legend?.tokenTypes)
+        assertEquals(listOf("declaration", "static"), legend?.tokenModifiers)
+
+        val futureLegend = das.semanticTokensLegendFuture.get(5, TimeUnit.SECONDS)
+        assertEquals(legend, futureLegend)
+    }
+
+    fun testUpdateClientCapabilities_handlesMissingLspCapabilitiesGracefully() {
+        val das = DartAnalysisServerService.getInstance(project)
+        das.updateClientCapabilities()
+
+        val jsonConsumer = capturedConsumer as JsonConsumer
+        jsonConsumer.onResponse(JsonObject(), null)
+
+        assertNull("Legend should be null when lspCapabilities is missing", das.semanticTokensLegend)
+        val futureLegend = das.semanticTokensLegendFuture.get(5, TimeUnit.SECONDS)
+        assertNull("Future should resolve to null when lspCapabilities is missing", futureLegend)
+    }
+
+    fun testUpdateClientCapabilities_handlesRequestErrorGracefully() {
+        val das = DartAnalysisServerService.getInstance(project)
+        das.updateClientCapabilities()
+
+        val jsonConsumer = capturedConsumer as JsonConsumer
+        jsonConsumer.onResponse(null, RequestError("SERVER_ERROR", "Error message", null))
+
+        assertNull("Legend should be null on request error", das.semanticTokensLegend)
+        val futureLegend = das.semanticTokensLegendFuture.get(5, TimeUnit.SECONDS)
+        assertNull("Future should resolve to null on request error", futureLegend)
+    }
+
+    fun testSemanticTokensFull_success() {
+        val params = SemanticTokensParams(TextDocumentIdentifier("file:///test.dart"))
+        val future = bridgeServer.semanticTokensFull(params)
+
+        val jsonObject = capturedRequests.find { it.get("method")?.asString == "lsp.handle" }
+        assertNotNull("An lsp.handle request should be sent to DAS", jsonObject)
+        assertEquals("123", jsonObject!!.get("id").asString)
+
+        val lspMessage = jsonObject.getAsJsonObject("params").getAsJsonObject("lspMessage")
+        assertEquals("123", lspMessage.get("id").asString)
+        assertEquals("textDocument/semanticTokens/full", lspMessage.get("method").asString)
+
+        val responseJson = """
+            {
+              "id": "123",
+              "result": {
+                "lspResponse": {
+                  "jsonrpc": "2.0",
+                  "id": "123",
+                  "result": {
+                    "data": [0, 4, 3, 0, 0, 1, 2, 5, 1, 2]
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        capturedListener.onResponse(responseJson)
+
+        val result = future.get(5, TimeUnit.SECONDS)
+        assertNotNull(result)
+        assertEquals(listOf(0, 4, 3, 0, 0, 1, 2, 5, 1, 2), result.data)
+    }
+
+    fun testSemanticTokensFull_errorReturnsNull() {
+        val params = SemanticTokensParams(TextDocumentIdentifier("file:///test.dart"))
+        val future = bridgeServer.semanticTokensFull(params)
+
+        val responseJson = """
+            {
+              "id": "123",
+              "result": {
+                "lspResponse": {
+                  "jsonrpc": "2.0",
+                  "id": "123",
+                  "error": {
+                    "code": -32601,
+                    "message": "Method not found"
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        capturedListener.onResponse(responseJson)
+
+        val result = future.get(5, TimeUnit.SECONDS)
+        assertNull("DAS error on semanticTokensFull should gracefully complete with null", result)
+    }
+
+    fun testDartLspSemanticTokensSupport_shouldAskServerForSemanticTokens() {
+        val dartFile = myFixture.configureByText("test.dart", "class Foo {}")
+        assertTrue("Should ask server for .dart files", DartLspSemanticTokensSupport.shouldAskServerForSemanticTokens(dartFile))
+
+        val txtFile = myFixture.configureByText("test.txt", "some text")
+        assertFalse("Should not ask server for .txt files", DartLspSemanticTokensSupport.shouldAskServerForSemanticTokens(txtFile))
+    }
+
+    fun testDartLspSemanticTokensSupport_getTextAttributesKey() {
+        val cases = listOf(
+            // Types & Classes
+            Triple(SemanticTokenTypes.Class, emptyList<String>(), DartSyntaxHighlighterColors.CLASS),
+            Triple(SemanticTokenTypes.Class, listOf("constructor"), DartSyntaxHighlighterColors.CONSTRUCTOR),
+            Triple(SemanticTokenTypes.Class, listOf("annotation"), DartSyntaxHighlighterColors.ANNOTATION),
+            Triple(SemanticTokenTypes.Enum, emptyList(), DartSyntaxHighlighterColors.ENUM),
+            Triple(SemanticTokenTypes.EnumMember, emptyList(), DartSyntaxHighlighterColors.ENUM_CONSTANT),
+            Triple(SemanticTokenTypes.TypeParameter, emptyList(), DartSyntaxHighlighterColors.TYPE_PARAMETER),
+            Triple(SemanticTokenTypes.Type, emptyList(), DartSyntaxHighlighterColors.TYPE_NAME_DYNAMIC),
+            Triple(SemanticTokenTypes.Type, listOf("typeAlias"), DartSyntaxHighlighterColors.TYPE_ALIAS),
+            Triple(SemanticTokenTypes.Type, listOf("functionTypeAlias"), DartSyntaxHighlighterColors.FUNCTION_TYPE_ALIAS),
+            Triple(SemanticTokenTypes.Class, listOf("mixin"), DartSyntaxHighlighterColors.MIXIN),
+            Triple(SemanticTokenTypes.Class, listOf("extension"), DartSyntaxHighlighterColors.EXTENSION),
+            Triple(SemanticTokenTypes.Class, listOf("extensionType"), DartSyntaxHighlighterColors.EXTENSION_TYPE),
+
+            // Methods & Constructors
+            Triple(SemanticTokenTypes.Method, listOf("constructor"), DartSyntaxHighlighterColors.CONSTRUCTOR),
+            Triple(SemanticTokenTypes.Method, listOf(SemanticTokenModifiers.Static, SemanticTokenModifiers.Declaration), DartSyntaxHighlighterColors.STATIC_METHOD_DECLARATION),
+            Triple(SemanticTokenTypes.Method, listOf(SemanticTokenModifiers.Static), DartSyntaxHighlighterColors.STATIC_METHOD_REFERENCE),
+            Triple(SemanticTokenTypes.Method, listOf("instance", SemanticTokenModifiers.Declaration), DartSyntaxHighlighterColors.INSTANCE_METHOD_DECLARATION),
+            Triple(SemanticTokenTypes.Method, listOf("instance"), DartSyntaxHighlighterColors.INSTANCE_METHOD_REFERENCE),
+            Triple(SemanticTokenTypes.Method, listOf("constructor", "tearOff"), DartSyntaxHighlighterColors.CONSTRUCTOR_TEAR_OFF),
+            Triple(SemanticTokenTypes.Method, listOf(SemanticTokenModifiers.Static, "tearOff"), DartSyntaxHighlighterColors.STATIC_METHOD_TEAR_OFF),
+            Triple(SemanticTokenTypes.Method, listOf("instance", "tearOff"), DartSyntaxHighlighterColors.INSTANCE_METHOD_TEAR_OFF),
+
+            // Functions
+            Triple(SemanticTokenTypes.Function, listOf(SemanticTokenModifiers.Static, SemanticTokenModifiers.Declaration), DartSyntaxHighlighterColors.TOP_LEVEL_FUNCTION_DECLARATION),
+            Triple(SemanticTokenTypes.Function, listOf(SemanticTokenModifiers.Declaration), DartSyntaxHighlighterColors.LOCAL_FUNCTION_DECLARATION),
+            Triple(SemanticTokenTypes.Function, listOf(SemanticTokenModifiers.Static), DartSyntaxHighlighterColors.TOP_LEVEL_FUNCTION_REFERENCE),
+            Triple(SemanticTokenTypes.Function, listOf(SemanticTokenModifiers.Static, "tearOff"), DartSyntaxHighlighterColors.TOP_LEVEL_FUNCTION_TEAR_OFF),
+            Triple(SemanticTokenTypes.Function, emptyList(), DartSyntaxHighlighterColors.LOCAL_FUNCTION_REFERENCE),
+            Triple(SemanticTokenTypes.Function, listOf("tearOff"), DartSyntaxHighlighterColors.LOCAL_FUNCTION_TEAR_OFF),
+
+            // Properties (Getters / Setters)
+            Triple(SemanticTokenTypes.Property, listOf(SemanticTokenModifiers.Static, SemanticTokenModifiers.Declaration), DartSyntaxHighlighterColors.STATIC_GETTER_DECLARATION),
+            Triple(SemanticTokenTypes.Property, listOf(SemanticTokenModifiers.Static), DartSyntaxHighlighterColors.STATIC_GETTER_REFERENCE),
+            Triple(SemanticTokenTypes.Property, listOf("instance", SemanticTokenModifiers.Declaration), DartSyntaxHighlighterColors.INSTANCE_GETTER_DECLARATION),
+            Triple(SemanticTokenTypes.Property, listOf("instance"), DartSyntaxHighlighterColors.INSTANCE_GETTER_REFERENCE),
+            Triple(SemanticTokenTypes.Property, listOf(SemanticTokenModifiers.Declaration), DartSyntaxHighlighterColors.TOP_LEVEL_GETTER_DECLARATION),
+            Triple(SemanticTokenTypes.Property, emptyList(), DartSyntaxHighlighterColors.TOP_LEVEL_GETTER_REFERENCE),
+
+            // Variables & Fields
+            Triple(SemanticTokenTypes.Variable, listOf("importPrefix"), DartSyntaxHighlighterColors.IMPORT_PREFIX),
+            Triple(SemanticTokenTypes.Variable, listOf(SemanticTokenModifiers.Static, SemanticTokenModifiers.Declaration), DartSyntaxHighlighterColors.STATIC_FIELD_DECLARATION),
+            Triple(SemanticTokenTypes.Variable, listOf(SemanticTokenModifiers.Static), DartSyntaxHighlighterColors.STATIC_FIELD_DECLARATION),
+            Triple(SemanticTokenTypes.Variable, listOf("instance", SemanticTokenModifiers.Declaration), DartSyntaxHighlighterColors.INSTANCE_FIELD_DECLARATION),
+            Triple(SemanticTokenTypes.Variable, listOf("instance"), DartSyntaxHighlighterColors.INSTANCE_FIELD_REFERENCE),
+            Triple(SemanticTokenTypes.Variable, listOf(SemanticTokenModifiers.Declaration), DartSyntaxHighlighterColors.LOCAL_VARIABLE_DECLARATION),
+            Triple(SemanticTokenTypes.Variable, emptyList(), DartSyntaxHighlighterColors.LOCAL_VARIABLE_REFERENCE),
+
+            // Parameters, Annotations, Labels, Namespaces, Keywords, Identifiers
+            Triple(SemanticTokenTypes.Parameter, listOf(SemanticTokenModifiers.Declaration), DartSyntaxHighlighterColors.PARAMETER_DECLARATION),
+            Triple(SemanticTokenTypes.Parameter, emptyList(), DartSyntaxHighlighterColors.PARAMETER_REFERENCE),
+            Triple("annotation", emptyList(), DartSyntaxHighlighterColors.ANNOTATION),
+            Triple("label", emptyList(), DartSyntaxHighlighterColors.LABEL),
+            Triple(SemanticTokenTypes.Namespace, emptyList(), DartSyntaxHighlighterColors.LIBRARY_NAME),
+            Triple(SemanticTokenTypes.Keyword, emptyList(), DartSyntaxHighlighterColors.KEYWORD),
+            Triple("source", emptyList(), DartSyntaxHighlighterColors.IDENTIFIER),
+
+            // Strings & Escapes
+            Triple(SemanticTokenTypes.String, listOf("escape"), DartSyntaxHighlighterColors.VALID_STRING_ESCAPE),
+
+            // Handled by local lexer (must return null)
+            Triple(SemanticTokenTypes.String, emptyList(), null),
+            Triple(SemanticTokenTypes.Comment, emptyList(), null),
+            Triple(SemanticTokenTypes.Comment, listOf(SemanticTokenModifiers.Documentation), null),
+            Triple(SemanticTokenTypes.Number, emptyList(), null),
+            Triple(SemanticTokenTypes.Operator, emptyList(), null),
+            Triple("boolean", emptyList(), null),
+        )
+
+        for ((type, modifiers, expected) in cases) {
+            assertEquals("Failed for type=$type, modifiers=$modifiers", expected, DartLspSemanticTokensSupport.getTextAttributesKey(type, modifiers))
+        }
     }
 
     fun testPublishDiagnosticsNotification() {
@@ -938,10 +1498,9 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
         assertNotNull(mockClient.publishedDiagnostics)
         assertEquals(fileUri, mockClient.publishedDiagnostics?.uri)
         assertEquals(1, mockClient.publishedDiagnostics?.diagnostics?.size)
-
-        // Also check that DartAnalysisServerService processed the diagnostic
-        val errorsHash = DartAnalysisServerService.getInstance(project).getFilePathsWithErrorsHash()
-        assertNotSame(0, errorsHash)
+        val publishedDiag = mockClient.publishedDiagnostics?.diagnostics?.first()
+        assertEquals("invalid_assignment", publishedDiag?.code?.left)
+        assertEquals("A value of type 'String' can't be assigned to a variable of type 'int'.", publishedDiag?.message)
     }
 
     fun testPublishClosingLabelsNotification() {
@@ -985,8 +1544,11 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
         // 1. Simulate the reverse notification arriving from DAS over the bridge
         capturedListener.onResponse(notificationJson)
 
-        // 2. Verify DartAnalysisServerService / DartServerData processed and stored the label
-        val closingLabels = DartLspClosingLabelsService.getInstance(project).getClosingLabels(testFile.virtualFile)
+        // 2. Verify DartBridgeLspServer forwarded the notification to the LSP client proxy
+        val published = mockClient.publishedClosingLabels
+        assertNotNull("dart/textDocument/publishClosingLabels should be forwarded to client", published)
+        assertEquals(fileUri, published?.uri)
+        val closingLabels = published?.labels ?: emptyList()
         assertEquals(1, closingLabels.size)
         assertEquals("MyWidget", closingLabels[0].label)
         assertEquals(2, closingLabels[0].range?.start?.line)
@@ -1035,6 +1597,253 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
         assertTrue(result.isRight)
         assertEquals(1, result.right.size)
         assertEquals("file://target.dart", result.right[0].targetUri)
+    }
+
+    fun testImplementationEnabledPreservesLegacyHierarchy() {
+        checkImplementationRouting(true, 1)
+    }
+
+    fun testImplementationDisabledPreservesLegacyHierarchy() {
+        checkImplementationRouting(false, 1)
+    }
+
+    private fun checkImplementationRouting(enabled: Boolean, expectedLegacyRequests: Int) {
+        val previous = DartConfigurable.isExperimentalLspFeaturesEnabled(project)
+        try {
+            DartConfigurable.setExperimentalLspFeaturesEnabled(project, enabled)
+            val file = myFixture.configureByText("source.dart", "class Source {}")
+            val declaration = requireNotNull(PsiTreeUtil.findChildOfType(file, DartClass::class.java))
+            DefinitionsScopedSearch.search(declaration).findAll()
+            assertEquals(expectedLegacyRequests, legacyHierarchyRequests)
+        } finally {
+            DartConfigurable.setExperimentalLspFeaturesEnabled(project, previous)
+        }
+    }
+
+    fun testDefinitionResponseAfterSocketCloseMatchesExistingRpcFailure() {
+        checkResponseAfterLocalSocketClose("textDocument/definition")
+    }
+
+    private fun checkResponseAfterLocalSocketClose(method: String) {
+        val executor = Executors.newCachedThreadPool()
+        val bridge = DartBridgeLspServer(project)
+        val dasRequest = CompletableFuture<JsonObject>()
+        val requestHandled = CompletableFuture<RequestMessage>()
+        val attempts = CopyOnWriteArrayList<ResponseMessage>()
+        val failures = CopyOnWriteArrayList<RuntimeException>()
+        val failedWrites = CountDownLatch(2)
+        val records = CopyOnWriteArrayList<java.util.logging.LogRecord>()
+        val logger = java.util.logging.Logger.getLogger(org.eclipse.lsp4j.jsonrpc.RemoteEndpoint::class.java.name)
+        val previousFilter = logger.filter
+        var clientFuture: CompletableFuture<*>? = null
+        capturedRequests.clear()
+        requestObserver = { request -> if (request.lspMethod() == method) dasRequest.complete(request) }
+        // Consume only the log caused by this fixture's captured write exception, not unrelated errors.
+        // The default RemoteEndpoint exception handler remains installed and still creates the error response.
+        logger.filter = java.util.logging.Filter { record ->
+            val expected = failures.firstOrNull()
+            if (expected != null && generateSequence(record.thrown) { it.cause }.any { it === expected }) {
+                records.add(record)
+                false
+            } else previousFilter?.isLoggable(record) ?: true
+        }
+        try {
+            ServerSocket(0, 1, InetAddress.getLoopbackAddress()).use { listener ->
+                listener.soTimeout = 10000
+                Socket().use { clientSocket ->
+                    clientSocket.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), listener.localPort), 5000)
+                    listener.accept().use { serverSocket ->
+                        val server = Launcher.Builder<LanguageClient>().setLocalService(bridge)
+                            .setRemoteInterface(LanguageClient::class.java).setExecutorService(executor)
+                            .setInput(serverSocket.getInputStream()).setOutput(serverSocket.getOutputStream())
+                            .wrapMessages { consumer -> MessageConsumer { message ->
+                                if (message is ResponseMessage) attempts.add(message)
+                                try {
+                                    consumer.consume(message)
+                                } catch (e: RuntimeException) {
+                                    if (message is ResponseMessage) {
+                                        failures.add(e)
+                                        failedWrites.countDown()
+                                    }
+                                    throw e // Let the real future chain attempt its error response.
+                                }
+                                if (message is RequestMessage && message.method == method) requestHandled.complete(message)
+                            } }.create()
+                        val client = Launcher.Builder<DartLanguageServer>().setLocalService(mockClient)
+                            .setRemoteInterface(DartLanguageServer::class.java).setExecutorService(executor)
+                            .setInput(clientSocket.getInputStream()).setOutput(clientSocket.getOutputStream()).create()
+                        bridge.connect(server.remoteProxy)
+                        server.startListening()
+                        client.startListening()
+                        clientFuture = client.remoteProxy.textDocumentService.definition(
+                            org.eclipse.lsp4j.DefinitionParams(TextDocumentIdentifier("file:///source.dart"), Position(0, 6)))
+                        val request = dasRequest.get(5, TimeUnit.SECONDS)
+                        // Completion after consume proves handleRequest has installed thenAccept/exceptionally.
+                        val rpc = requestHandled.get(5, TimeUnit.SECONDS)
+                        assertEquals(method, rpc.method)
+                        assertEquals(method, request.lspMethod())
+                        assertEquals(1, capturedRequests.size)
+                        val pending = DartBridgeLspServer::class.java.getDeclaredField("pendingRequests")
+                            .apply { isAccessible = true }.get(bridge) as Map<*, *>
+                        val dasId = request.get("id").asString
+                        assertTrue(pending.containsKey(dasId))
+                        assertFalse(requireNotNull(clientFuture).isDone)
+                        assertEmpty(attempts)
+                        serverSocket.close() // Local close, not a peer FIN: the retained output stream must fail its next write.
+                        assertTrue(serverSocket.isClosed)
+                        completeEmptyNavigationResponse(request)
+                        assertTrue("$method must reach both actual response writes", failedWrites.await(5, TimeUnit.SECONDS))
+                        assertFalse(pending.containsKey(dasId))
+                        assertEquals(listOf(rpc.id, rpc.id), attempts.map { it.id })
+                        assertNull(attempts[0].error)
+                        assertNotNull(attempts[0].result)
+                        assertEquals(ResponseErrorCode.InternalError.value, attempts[1].error.code)
+                        assertEquals(2, failures.size)
+                        for ((index, failure) in failures.withIndex()) {
+                            val socketFailure = generateSequence<Throwable>(failure) { it.cause }
+                                .filterIsInstance<java.net.SocketException>().single()
+                            assertEquals("Socket closed", socketFailure.message)
+                            assertTrue(failure.stackTrace.any {
+                                it.className == "org.eclipse.lsp4j.jsonrpc.json.StreamMessageConsumer" && it.methodName == "consume"
+                            })
+                            assertTrue(failure.stackTrace.any {
+                                it.className == "org.eclipse.lsp4j.jsonrpc.RemoteEndpoint" && it.methodName.contains("handleRequest")
+                            })
+                            println("$method rpcId=${rpc.id} dasId=$dasId responseAttempt=${index + 1} error=${attempts[index].error?.code}")
+                            failure.printStackTrace(System.out)
+                        }
+                        assertEquals(1, records.size)
+                        assertEquals(java.util.logging.Level.SEVERE, records.single().level)
+                        assertSame(failures[0], generateSequence(records.single().thrown) { it.cause }
+                            .first { it === failures[0] })
+                    }
+                }
+            }
+        } finally {
+            // Settle locally without attempting a cancellation notification on the closed transport.
+            clientFuture?.completeExceptionally(java.util.concurrent.CancellationException("Diagnostic transport closed"))
+            requestObserver = null
+            bridge.stop()
+            executor.shutdownNow()
+            try {
+                assertTrue("Close diagnostic threads must terminate", executor.awaitTermination(10, TimeUnit.SECONDS))
+            } finally {
+                logger.filter = previousFilter
+            }
+        }
+    }
+
+    private fun JsonObject.lspMethod(): String? {
+        val params = getAsJsonObject("params") ?: return null
+        return (params.getAsJsonObject("lspMessage") ?: params.getAsJsonObject("lspNotification"))?.get("method")?.asString
+    }
+
+    private fun completeEmptyNavigationResponse(request: JsonObject) {
+        val id = request.get("id").asString
+        capturedListener.onResponse("""{"id":"$id","result":{"lspResponse":{"jsonrpc":"2.0","id":"$id","result":[]}}}""")
+    }
+
+    fun testSuperEnabledWithoutServerDoesNotRequestLegacyHierarchy() {
+        checkSuperRouting(true)
+    }
+
+    fun testSuperDisabledPreservesLegacyHierarchy() {
+        checkSuperRouting(false)
+    }
+
+    private fun checkSuperRouting(enabled: Boolean) {
+        val previous = DartConfigurable.isExperimentalLspFeaturesEnabled(project)
+        try {
+            DartConfigurable.setExperimentalLspFeaturesEnabled(project, enabled)
+            val file = myFixture.configureByText("source.dart", "class Sou<caret>rce {}")
+            assertEmpty("No hierarchy work should precede the action", legacyHierarchyArguments)
+            com.jetbrains.lang.dart.ide.actions.DartServerGotoSuperHandler().invoke(project, myFixture.editor, file)
+            if (enabled) {
+                assertEquals(0, legacyHierarchyRequests)
+                assertEmpty(legacyHierarchyArguments)
+            } else {
+                // Routing, not supplier invocation count, is the legacy action's contract.
+                assertTrue("OFF must request legacy hierarchy", legacyHierarchyArguments.isNotEmpty())
+                val expected = Triple(DartAnalysisServerService.getInstance(project).getFileUri(file.virtualFile), 6, true)
+                assertTrue("Unexpected legacy requests: $legacyHierarchyArguments", legacyHierarchyArguments.all { it == expected })
+            }
+            assertFalse("Neither OFF nor ON without a server may send a custom Super request", capturedRequests.any {
+                it.get("method")?.asString == "lsp.handle" &&
+                    it.getAsJsonObject("params")?.getAsJsonObject("lspMessage")?.get("method")?.asString == "dart/textDocument/super"
+            })
+        } finally {
+            DartConfigurable.setExperimentalLspFeaturesEnabled(project, previous)
+        }
+    }
+
+    fun testCanceledSuperActionDoesNotRequestLegacyHierarchy() {
+        val previous = DartConfigurable.isExperimentalLspFeaturesEnabled(project)
+        try {
+            DartConfigurable.setExperimentalLspFeaturesEnabled(project, true)
+            val file = myFixture.configureByText("source.dart", "class Sou<caret>rce {}")
+            val editor = myFixture.editor
+            ApplicationManager.getApplication().executeOnPooledThread {
+                val indicator = com.intellij.openapi.progress.EmptyProgressIndicator()
+                try {
+                    com.intellij.openapi.progress.ProgressManager.getInstance().runProcess(Runnable {
+                        indicator.cancel()
+                        com.jetbrains.lang.dart.ide.actions.DartServerGotoSuperHandler().invoke(project, editor, file)
+                    }, indicator)
+                    fail("Canceled Super action must propagate cancellation")
+                } catch (_: com.intellij.openapi.progress.ProcessCanceledException) {
+                    // The action must not convert cancellation into legacy navigation.
+                }
+            }.get(5, TimeUnit.SECONDS)
+            assertEquals(0, legacyHierarchyRequests)
+        } finally {
+            DartConfigurable.setExperimentalLspFeaturesEnabled(project, previous)
+        }
+    }
+
+    fun testSuperRequestReturnsOneNativeLocation() {
+        val params = org.eclipse.lsp4j.TextDocumentPositionParams(TextDocumentIdentifier("file:///source.dart"), Position(2, 17))
+        val future = bridgeServer.getSuper(params)
+        val request = requireNotNull(capturedRequests.find { it.get("method")?.asString == "lsp.handle" })
+        val message = request.getAsJsonObject("params").getAsJsonObject("lspMessage")
+        assertEquals("dart/textDocument/super", message.get("method").asString)
+        assertEquals("file:///source.dart", message.getAsJsonObject("params").getAsJsonObject("textDocument").get("uri").asString)
+        assertEquals(2, message.getAsJsonObject("params").getAsJsonObject("position").get("line").asInt)
+        assertEquals(17, message.getAsJsonObject("params").getAsJsonObject("position").get("character").asInt)
+        capturedListener.onResponse("""
+            {"id":"123","result":{"lspResponse":{"jsonrpc":"2.0","id":"123","result":
+              {"uri":"file:///parent.dart","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":13}}}
+            }}}
+        """.trimIndent())
+        val result = requireNotNull(future.get(5, TimeUnit.SECONDS))
+        assertEquals("file:///parent.dart", result.uri)
+        assertEquals(Position(1, 7), result.range.start)
+        assertEquals(0, legacyHierarchyRequests)
+    }
+
+    fun testSuperNullResultDoesNotRequestLegacyHierarchy() {
+        val future = bridgeServer.getSuper(org.eclipse.lsp4j.TextDocumentPositionParams(TextDocumentIdentifier("file:///source.dart"), Position(0, 0)))
+        capturedListener.onResponse("""
+            {"id":"123","result":{"lspResponse":{"jsonrpc":"2.0","id":"123","result":null}}}
+        """.trimIndent())
+        assertNull(future.get(5, TimeUnit.SECONDS))
+        assertEquals(0, legacyHierarchyRequests)
+    }
+
+    fun testSuperUnsupportedAndErrorResponsesDoNotRequestLegacyHierarchy() {
+        for (code in listOf(-32601, -32603)) {
+            val future = bridgeServer.getSuper(org.eclipse.lsp4j.TextDocumentPositionParams(TextDocumentIdentifier("file:///source.dart"), Position(0, 0)))
+            capturedListener.onResponse("""
+                {"id":"123","result":{"lspResponse":{"jsonrpc":"2.0","id":"123",
+                "error":{"code":$code,"message":"Unavailable"}}}}
+            """.trimIndent())
+            try {
+                future.get(5, TimeUnit.SECONDS)
+                fail("The public LSP client must receive the error")
+            } catch (e: java.util.concurrent.ExecutionException) {
+                assertTrue(e.cause is org.eclipse.lsp4j.jsonrpc.ResponseErrorException)
+            }
+        }
+        assertEquals(0, legacyHierarchyRequests)
     }
 
     // --- Hierarchy ---
@@ -1614,6 +2423,187 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
         assertEquals(true, lspResponse.getAsJsonObject("result").get("applied").asBoolean)
     }
 
+    fun testWorkspaceConfigurationRequestForwardedAndResponseSentBack() {
+        val dartConfig = JsonObject().apply {
+            add(DartLspInlayHintsConfiguration.INLAY_HINTS_KEY, JsonObject())
+        }
+        mockClient.configurationResult = listOf(dartConfig, null)
+
+        val serverRequestJson = """
+            {
+              "id": "das_cfg_1",
+              "method": "lsp.handle",
+              "params": {
+                "lspMessage": {
+                  "jsonrpc": "2.0",
+                  "id": 7,
+                  "method": "workspace/configuration",
+                  "params": {
+                    "items": [
+                      { "section": "dart" },
+                      { "section": "flutter" }
+                    ]
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        capturedListener.onResponse(serverRequestJson)
+
+        val receivedParams = requireNotNull(mockClient.lastConfigurationParams) {
+            "Client should have received configuration params"
+        }
+        assertEquals(2, receivedParams.items.size)
+        assertEquals("dart", receivedParams.items[0].section)
+        assertEquals("flutter", receivedParams.items[1].section)
+
+        val responseJsonObject = requireNotNull(capturedResponses.find { it.get("id")?.asString == "das_cfg_1" }) {
+            "A response should be sent back to DAS with id das_cfg_1"
+        }
+        val lspResponse = requireNotNull(responseJsonObject.getAsJsonObject("result")?.getAsJsonObject("lspResponse")) {
+            "response should contain lspResponse"
+        }
+        assertEquals(7, lspResponse.get("id").asInt)
+        val resultArray = requireNotNull(lspResponse.getAsJsonArray("result")) {
+            "lspResponse should contain a result array"
+        }
+        assertEquals(2, resultArray.size())
+        assertEquals(dartConfig, resultArray[0].asJsonObject)
+        assertTrue(resultArray[1].isJsonNull)
+    }
+
+    fun testWorkspaceConfigurationAnsweredWithNullsWhenNoClientConnected() {
+        bridgeServer.stop()
+        val unconnectedBridge = DartBridgeLspServer(project)
+        try {
+            val serverRequestJson = """
+                {
+                  "id": "das_cfg_no_client",
+                  "method": "lsp.handle",
+                  "params": {
+                    "lspMessage": {
+                      "jsonrpc": "2.0",
+                      "id": 8,
+                      "method": "workspace/configuration",
+                      "params": {
+                        "items": [
+                          { "section": "dart" },
+                          { "section": "flutter" }
+                        ]
+                      }
+                    }
+                  }
+                }
+            """.trimIndent()
+
+            capturedListener.onResponse(serverRequestJson)
+
+            val responseJsonObject = requireNotNull(capturedResponses.find { it.get("id")?.asString == "das_cfg_no_client" }) {
+                "A response should be sent back to DAS even when no client is connected"
+            }
+            val lspResponse = requireNotNull(responseJsonObject.getAsJsonObject("result")?.getAsJsonObject("lspResponse"))
+            assertEquals(8, lspResponse.get("id").asInt)
+            val resultArray = requireNotNull(lspResponse.getAsJsonArray("result"))
+            assertEquals(2, resultArray.size())
+            assertTrue(resultArray[0].isJsonNull)
+            assertTrue(resultArray[1].isJsonNull)
+        } finally {
+            unconnectedBridge.stop()
+        }
+    }
+
+    fun testWorkspaceConfigurationAnsweredWithNullsWhenParamsMalformed() {
+        val serverRequestJson = """
+            {
+              "id": "das_cfg_malformed",
+              "method": "lsp.handle",
+              "params": {
+                "lspMessage": {
+                  "jsonrpc": "2.0",
+                  "id": 9,
+                  "method": "workspace/configuration",
+                  "params": {
+                    "items": [
+                      "not_an_object",
+                      123
+                    ]
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        capturedListener.onResponse(serverRequestJson)
+
+        val responseJsonObject = requireNotNull(capturedResponses.find { it.get("id")?.asString == "das_cfg_malformed" }) {
+            "A response should be sent back to DAS even when params fail to parse"
+        }
+        val lspResponse = requireNotNull(responseJsonObject.getAsJsonObject("result")?.getAsJsonObject("lspResponse"))
+        assertEquals(9, lspResponse.get("id").asInt)
+        val resultArray = requireNotNull(lspResponse.getAsJsonArray("result"))
+        assertEquals(2, resultArray.size())
+        assertTrue(resultArray[0].isJsonNull)
+        assertTrue(resultArray[1].isJsonNull)
+    }
+
+    fun testStopWithdrawsWorkspaceConfigurationCapability() {
+        capturedRequests.clear()
+        bridgeServer.initialize(InitializeParams()).get(5, TimeUnit.SECONDS)
+
+        val initCapReq = requireNotNull(capturedRequests.lastOrNull { it.get("method")?.asString == "server.setClientCapabilities" }) {
+            "initialize() should send server.setClientCapabilities"
+        }
+        val initWorkspaceCap = initCapReq.getAsJsonObject("params")
+            .getAsJsonObject("lspCapabilities")
+            .getAsJsonObject("workspace")
+        assertTrue(initWorkspaceCap.get("configuration").asBoolean)
+
+        capturedRequests.clear()
+        bridgeServer.stop()
+        assertFalse("isClientConnected should be false after stop()", bridgeServer.isClientConnected)
+
+        val stopCapReq = requireNotNull(capturedRequests.lastOrNull { it.get("method")?.asString == "server.setClientCapabilities" }) {
+            "stop() should withdraw workspace.configuration via server.setClientCapabilities"
+        }
+        val stopWorkspaceCap = stopCapReq.getAsJsonObject("params")
+            .getAsJsonObject("lspCapabilities")
+            .getAsJsonObject("workspace")
+        assertFalse(stopWorkspaceCap?.has("configuration") == true)
+    }
+
+    fun testDescriptorClientCapabilitiesAndInitializationOptions() {
+        val descriptor = DartLspServerDescriptor(project)
+        val capabilities = descriptor.clientCapabilities
+
+        assertEquals(true, capabilities.workspace?.fileOperations?.willRename)
+        assertEquals(true, capabilities.textDocument?.publishDiagnostics?.relatedInformation)
+        assertEquals(true, capabilities.textDocument?.publishDiagnostics?.codeDescriptionSupport)
+
+        val experimental = capabilities.experimental as? Map<*, *>
+        assertNotNull("experimental capabilities should be a Map", experimental)
+        assertTrue("experimental capabilities should include closingLabels", experimental!!.containsKey("closingLabels"))
+
+        val initOptions = descriptor.createInitializationOptions() as? Map<*, *>
+        assertNotNull("initializationOptions should be a Map", initOptions)
+        assertEquals(true, initOptions!!["closingLabels"])
+    }
+
+    fun testDescriptorGetWorkspaceConfiguration() {
+        val descriptor = DartLspServerDescriptor(project)
+
+        val dartItem = ConfigurationItem().apply { section = "dart" }
+        val dartConfig = descriptor.getWorkspaceConfiguration(dartItem) as? JsonObject
+        assertNotNull("dart section should return a JsonObject", dartConfig)
+        assertNotNull(
+            "dart section should contain inlayHints",
+            dartConfig!!.getAsJsonObject(DartLspInlayHintsConfiguration.INLAY_HINTS_KEY)
+        )
+
+        val unknownItem = ConfigurationItem().apply { section = "flutter" }
+        assertNull("unknown section should return null", descriptor.getWorkspaceConfiguration(unknownItem))
+    }
+
     fun testForwardRequestUpdatesFilesContentFromBackgroundThread() {
         val das = DartAnalysisServerService.getInstance(project)
         val changedDocsField = DartAnalysisServerService::class.java.getDeclaredField("myChangedDocuments").apply {
@@ -1653,14 +2643,214 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
         assertEquals(1, capturedRequests.size)
     }
 
-    private class MockLanguageClient : LanguageClient {
+    fun testIsDartSdkVersionSufficientForLspHighlighting() {
+        assertTrue(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("3.15.0-67.0.dev"))
+        assertTrue(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("3.15.0-68.0.dev"))
+        assertTrue(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("3.15.0"))
+        assertTrue(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("4.0.0"))
+
+        assertFalse(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("3.15.0-66.0.dev"))
+        assertFalse(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("3.14.0-307.0.dev"))
+        assertFalse(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("3.14.0-217.0.dev"))
+        assertFalse(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("3.14.0-65.0.dev"))
+        assertFalse(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("3.13.0"))
+        assertFalse(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("3.0.0"))
+        assertFalse(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("2.19.0"))
+        assertFalse(DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting("2.14.0"))
+    }
+
+    fun testIsLspHighlightingEnabled() {
+        val properties = PropertiesComponent.getInstance(project)
+        val sdk = DartSdk.getDartSdk(project)
+        assertNotNull(sdk)
+        val versionField = DartSdk::class.java.getDeclaredField("myVersion").apply { isAccessible = true }
+        val originalVersion = sdk!!.version
+        try {
+            properties.setValue("dart.lsp.experimental.enabled", true, true)
+
+            versionField.set(sdk, "3.15.0")
+            assertTrue("Expected highlighting enabled on SDK 3.15.0", DartAnalysisServerService.isLspHighlightingEnabled(project))
+
+            versionField.set(sdk, "3.13.0")
+            assertFalse("Expected highlighting disabled on SDK 3.13.0", DartAnalysisServerService.isLspHighlightingEnabled(project))
+
+            properties.setValue("dart.lsp.experimental.enabled", false, true)
+            versionField.set(sdk, "3.15.0")
+            assertFalse("Expected highlighting disabled when experimental setting is false", DartAnalysisServerService.isLspHighlightingEnabled(project))
+        } finally {
+            properties.unsetValue("dart.lsp.experimental.enabled")
+            versionField.set(sdk, originalVersion)
+        }
+    }
+
+    fun testIsLspHighlightingActive() {
+        val properties = PropertiesComponent.getInstance(project)
+        val das = DartAnalysisServerService.getInstance(project)
+        try {
+            properties.setValue("dart.lsp.experimental.enabled", true, true)
+            // Initially before bridge initialization or legend advertisement:
+            assertFalse(das.isSemanticTokensAdvertised)
+            assertFalse(DartAnalysisServerService.isLspHighlightingActive(project))
+
+            // Simulate advertisement:
+            das.setSemanticTokensAdvertised(true)
+            val sdk = DartSdk.getDartSdk(project)
+            assertNotNull(sdk)
+            val isSufficient = DartAnalysisServerService.isDartSdkVersionSufficientForLspHighlighting(sdk!!.version)
+            assertEquals(isSufficient, DartAnalysisServerService.isLspHighlightingActive(project))
+
+            // When experimental LSP is disabled, highlighting is not active even if advertised:
+            properties.setValue("dart.lsp.experimental.enabled", false, true)
+            assertFalse(DartAnalysisServerService.isLspHighlightingActive(project))
+
+            // Reset back:
+            das.setSemanticTokensAdvertised(false)
+            assertFalse(DartAnalysisServerService.isLspHighlightingActive(project))
+        } finally {
+            properties.unsetValue("dart.lsp.experimental.enabled")
+            das.setSemanticTokensAdvertised(false)
+        }
+    }
+
+    fun testSemanticTokensLegendFuture_notMutatedOnTimeout() {
+        val das = DartAnalysisServerService.getInstance(project)
+        val legendFuture = das.semanticTokensLegendFuture
+        assertFalse(legendFuture.isDone)
+
+        // Simulating the timeout pattern used in DartBridgeLspServer.initialize:
+        val timedOutCopy = legendFuture.copy().completeOnTimeout(null, 50, TimeUnit.MILLISECONDS)
+        val copyResult = timedOutCopy.get(1, TimeUnit.SECONDS)
+        assertNull("Copy should have completed with null on timeout", copyResult)
+
+        // The original shared future in DAS must NOT be completed:
+        assertFalse("Original future in DAS must remain uncompleted after copy timeout", legendFuture.isDone)
+
+        // Now verify real DAS response can still complete the original future:
+        val legend = SemanticTokensLegend(listOf("class"), listOf("declaration"))
+        assertTrue("Original future should accept completion", legendFuture.complete(legend))
+        assertEquals(legend, das.semanticTokensLegendFuture.get())
+    }
+
+    fun testInitializeCapabilitiesIncludesSignatureHelpOptions() {
+        val initResult = bridgeServer.initialize(InitializeParams()).get(5, TimeUnit.SECONDS)
+        val signatureHelpOptions = initResult.capabilities.signatureHelpProvider
+        assertNotNull("signatureHelpProvider capability must be set", signatureHelpOptions)
+        assertEquals(listOf("(", ","), signatureHelpOptions.triggerCharacters)
+        assertEquals(listOf(","), signatureHelpOptions.retriggerCharacters)
+    }
+
+    fun testSignatureHelpRequest() {
+        val params = SignatureHelpParams(TextDocumentIdentifier("file:///test.dart"), Position(1, 10))
+        val future = bridgeServer.signatureHelp(params)
+
+        val jsonObject = requireNotNull(capturedRequests.find { it.get("method")?.asString == "lsp.handle" }) {
+            "An lsp.handle request should be sent to DAS"
+        }
+        assertEquals("123", jsonObject.get("id")?.asString)
+
+        val lspMessage = jsonObject.getAsJsonObject("params").getAsJsonObject("lspMessage")
+        assertEquals("textDocument/signatureHelp", lspMessage.get("method").asString)
+
+        val responseJson = """
+            {
+              "id": "123",
+              "result": {
+                "lspResponse": {
+                  "jsonrpc": "2.0",
+                  "id": "123",
+                  "result": {
+                    "signatures": [
+                      {
+                        "label": "someFn(int a, String b)",
+                        "parameters": [
+                          { "label": "int a" },
+                          { "label": "String b" }
+                        ]
+                      }
+                    ],
+                    "activeSignature": 0,
+                    "activeParameter": 1
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        capturedListener.onResponse(responseJson)
+
+        val result = future.get(5, TimeUnit.SECONDS)
+        assertNotNull(result)
+        assertEquals(1, result.signatures.size)
+        assertEquals("someFn(int a, String b)", result.signatures[0].label)
+        assertEquals(2, result.signatures[0].parameters.size)
+        assertEquals("int a", result.signatures[0].parameters[0].label.left)
+        assertEquals("String b", result.signatures[0].parameters[1].label.left)
+        assertEquals(0, result.activeSignature)
+        assertEquals(1, result.activeParameter)
+    }
+
+    fun testSignatureHelpRequestWithNullResult() {
+        val params = SignatureHelpParams(TextDocumentIdentifier("file:///test.dart"), Position(0, 0))
+        val future = bridgeServer.signatureHelp(params)
+
+        val jsonObject = requireNotNull(capturedRequests.find { it.get("method")?.asString == "lsp.handle" }) {
+            "An lsp.handle request should be sent to DAS"
+        }
+        assertEquals("123", jsonObject.get("id")?.asString)
+
+        val responseJson = """
+            {
+              "id": "123",
+              "result": {
+                "lspResponse": {
+                  "jsonrpc": "2.0",
+                  "id": "123",
+                  "result": null
+                }
+              }
+            }
+        """.trimIndent()
+
+        capturedListener.onResponse(responseJson)
+
+        val result = future.get(5, TimeUnit.SECONDS)
+        assertNull(result)
+    }
+
+    fun testDescriptorSignatureHelpCustomizer() {
+        val properties = PropertiesComponent.getInstance(project)
+        val descriptor = DartLspServerDescriptor(project)
+        try {
+            properties.setValue("dart.lsp.experimental.enabled", true, true)
+            assertTrue(descriptor.lspCustomization.signatureHelpCustomizer is LspSignatureHelpSupport)
+
+            properties.setValue("dart.lsp.experimental.enabled", false, true)
+            assertSame(LspSignatureHelpDisabled, descriptor.lspCustomization.signatureHelpCustomizer)
+        } finally {
+            properties.unsetValue("dart.lsp.experimental.enabled")
+        }
+    }
+
+    private class MockLanguageClient : DartLanguageClient {
         var publishedDiagnostics: PublishDiagnosticsParams? = null
+        var publishedClosingLabels: DartPublishClosingLabelsParams? = null
         var lastApplyWorkspaceEditParams: ApplyWorkspaceEditParams? = null
         var applyEditResult: ApplyWorkspaceEditResponse = ApplyWorkspaceEditResponse(true)
+        var lastConfigurationParams: ConfigurationParams? = null
+        var configurationResult: List<Any?> = emptyList()
+
+        override fun publishClosingLabels(params: DartPublishClosingLabelsParams) {
+            publishedClosingLabels = params
+        }
 
         override fun applyEdit(params: ApplyWorkspaceEditParams?): CompletableFuture<ApplyWorkspaceEditResponse> {
             lastApplyWorkspaceEditParams = params
             return CompletableFuture.completedFuture(applyEditResult)
+        }
+
+        override fun configuration(params: ConfigurationParams?): CompletableFuture<List<Any?>> {
+            lastConfigurationParams = params
+            return CompletableFuture.completedFuture(configurationResult)
         }
 
         override fun publishDiagnostics(diagnostics: PublishDiagnosticsParams?) {

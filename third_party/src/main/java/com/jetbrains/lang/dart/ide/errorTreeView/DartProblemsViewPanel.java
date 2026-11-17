@@ -1,6 +1,7 @@
 // Copyright 2000-2021 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 package com.jetbrains.lang.dart.ide.errorTreeView;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.intellij.icons.AllIcons;
 import com.intellij.ide.BrowserUtil;
 import com.intellij.ide.CopyProvider;
@@ -79,8 +80,9 @@ public class DartProblemsViewPanel extends SimpleToolWindowPanel implements Copy
 
   private final @NotNull DartProblemsPresentationHelper myPresentationHelper;
 
-  DartProblemsViewPanel(@NotNull Project project,
-                        @NotNull DartProblemsPresentationHelper presentationHelper) {
+  @VisibleForTesting
+  public DartProblemsViewPanel(@NotNull Project project,
+                               @NotNull DartProblemsPresentationHelper presentationHelper) {
     super(false, true);
     myProject = project;
     myPresentationHelper = presentationHelper;
@@ -167,12 +169,19 @@ public class DartProblemsViewPanel extends SimpleToolWindowPanel implements Copy
       @NlsSafe String fixMessage = sourceChangeFix.getMessage();
       group.add(new AnAction(fixMessage, null, AllIcons.Actions.QuickfixBulb) {
         @Override
+        public @NotNull ActionUpdateThread getActionUpdateThread() {
+          return ActionUpdateThread.BGT;
+        }
+
+        @Override
         public void actionPerformed(@NotNull AnActionEvent event) {
           OpenSourceUtil.navigate(PsiNavigationSupport.getInstance().createNavigatable(myProject, selectedVFile, problem.getOffset()));
           try {
             WriteAction.run(() -> AssistUtils.applySourceChange(myProject, sourceChangeFix, true));
           }
           catch (DartSourceEditException ignored) {/**/}
+
+          Analytics.report(AnalyticsData.forAction(this, event));
         }
       });
     }
@@ -200,6 +209,11 @@ public class DartProblemsViewPanel extends SimpleToolWindowPanel implements Copy
       if (StringUtil.isNotEmpty(message) && vFile != null) {
         group.add(new DumbAwareAction(message, null, jumpToSourceIcon) {
           @Override
+          public @NotNull ActionUpdateThread getActionUpdateThread() {
+            return ActionUpdateThread.BGT;
+          }
+
+          @Override
           public void actionPerformed(@NotNull AnActionEvent e) {
             int offset = DartAnalysisServerService.getInstance(myProject).getConvertedOffset(vFile, location.getOffset());
             OpenSourceUtil.navigate(PsiNavigationSupport.getInstance().createNavigatable(myProject, vFile, offset));
@@ -218,6 +232,11 @@ public class DartProblemsViewPanel extends SimpleToolWindowPanel implements Copy
     group.add(new DumbAwareAction(DartBundle.messagePointer("action.DartProblemsViewPanel.open.documentation.text"),
                                   DartBundle.messagePointer("action.DartProblemsViewPanel.open.documentation.description"),
                                   AllIcons.Ide.External_link_arrow) {
+      @Override
+      public @NotNull ActionUpdateThread getActionUpdateThread() {
+        return ActionUpdateThread.BGT;
+      }
+
       @Override
       public void actionPerformed(@NotNull AnActionEvent e) {
         BrowserUtil.browse(url);
@@ -416,6 +435,11 @@ public class DartProblemsViewPanel extends SimpleToolWindowPanel implements Copy
   void clearAll() {
     ((DartProblemsTableModel)myTable.getModel()).removeAll();
     updateStatusDescription();
+  }
+
+  @VisibleForTesting
+  public int getRowCount() {
+    return myTable.getRowCount();
   }
 
   private class FilterProblemsAction extends DumbAwareAction implements Toggleable {

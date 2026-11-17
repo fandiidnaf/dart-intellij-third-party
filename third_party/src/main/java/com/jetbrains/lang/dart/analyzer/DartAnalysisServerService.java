@@ -32,14 +32,17 @@ import com.google.dart.server.OrganizeDirectivesConsumer;
 import com.google.dart.server.RequestListener;
 import com.google.dart.server.ResponseListener;
 import com.google.dart.server.SortMembersConsumer;
+import com.google.dart.server.JsonConsumer;
 import com.google.dart.server.generated.AnalysisServer;
 import com.google.dart.server.internal.remote.DebugPrintStream;
 import com.google.dart.server.internal.remote.RemoteAnalysisServerImpl;
 import com.google.dart.server.internal.remote.StdioServerSocket;
 import com.google.dart.server.utilities.logging.Logging;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.intellij.codeInsight.CodeInsightSettings;
+import com.intellij.codeInsight.daemon.DaemonCodeAnalyzer;
 import com.intellij.openapi.Disposable;
 import com.intellij.openapi.application.ApplicationInfo;
 import com.intellij.openapi.application.ApplicationManager;
@@ -95,9 +98,10 @@ import com.jetbrains.lang.dart.ide.actions.DartPubActionBase;
 import com.jetbrains.lang.dart.ide.completion.DartCompletionTimerExtension;
 import com.jetbrains.lang.dart.ide.errorTreeView.DartProblemsView;
 import com.jetbrains.lang.dart.ide.template.postfix.DartPostfixTemplateProvider;
-import com.jetbrains.lang.dart.ide.toolingDaemon.DartToolingDaemonService;
 import com.jetbrains.lang.dart.logging.PluginLogger;
 import com.jetbrains.lang.dart.lsp.DartBridgeLspServerManager;
+import com.jetbrains.lang.dart.lsp.DartLspClosingLabel;
+import com.jetbrains.lang.dart.lsp.DartLspClosingLabelsService;
 import com.jetbrains.lang.dart.lsp.DartLspConfigurationSync;
 import com.jetbrains.lang.dart.sdk.DartConfigurable;
 import com.jetbrains.lang.dart.sdk.DartSdk;
@@ -143,10 +147,14 @@ import org.dartlang.analysis.server.protocol.SourceChange;
 import org.dartlang.analysis.server.protocol.SourceEdit;
 import org.dartlang.analysis.server.protocol.SourceFileEdit;
 import org.dartlang.analysis.server.protocol.TypeHierarchyItem;
+import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.Range;
+import org.eclipse.lsp4j.SemanticTokensLegend;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NonNls;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
 
 import java.io.File;
 import java.net.URI;
@@ -162,8 +170,10 @@ import java.util.Map;
 import java.util.MissingResourceException;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class DartAnalysisServerService implements Disposable {
   public static final String MIN_SDK_VERSION = "2.12";
@@ -194,6 +204,9 @@ public final class DartAnalysisServerService implements Disposable {
   // MIN_LSP_PUBLISH_DIAGNOSTICS_SDK_VERSION because LSP quick fixes in the JetBrains LSP client
   // depend on publishDiagnostics notifications.
   public static final String MIN_LSP_CODE_ACTIONS_SDK_VERSION = MIN_LSP_PUBLISH_DIAGNOSTICS_SDK_VERSION;
+  // The first Dart SDK with dart-lang/sdk@d31d8fa0721 (Analysis Server API 1.43.0), which returns
+  // semanticTokensProvider in server.setClientCapabilities response for LSP-over-Legacy clients.
+  public static final String MIN_LSP_HIGHLIGHTING_SDK_VERSION = "3.15.0-67.0.dev";
 
   private static final long UPDATE_FILES_TIMEOUT = 300;
 
@@ -242,6 +255,10 @@ public final class DartAnalysisServerService implements Disposable {
   // see DartLspConfigurationSync.
   private volatile @NotNull String mySdkVersion = "";
   private @Nullable String mySdkHome;
+  private volatile @Nullable SemanticTokensLegend mySemanticTokensLegend;
+  private volatile boolean mySemanticTokensAdvertised = false;
+  private final AtomicReference<CompletableFuture<SemanticTokensLegend>> mySemanticTokensLegendFuture =
+    new AtomicReference<>(new CompletableFuture<>());
 
   private final DartServerRootsHandler myRootsHandler;
   private final Map<String, Long> myFilePathWithOverlaidContentToTimestamp = Collections.synchronizedMap(new HashMap<>());
@@ -263,12 +280,7 @@ public final class DartAnalysisServerService implements Disposable {
 
   private boolean myHaveShownInitialProgress;
   private boolean mySentAnalysisBusy;
-  private @Nullable String myDtdUri;
 
-  // files with red squiggles in Project View. This field is also used as a lock to access these 3 collections
-  private final @NotNull Set<String> myFilePathsWithErrors = new HashSet<>();
-  // how many files with errors are in this folder (recursively)
-  private final @NotNull Object2IntMap<String> myFolderPathsWithErrors = new Object2IntOpenHashMap<>();
   // errors hash is tracked to optimize error notification listener: do not handle equal notifications more than once
   private final @NotNull Object2IntMap<String> myFilePathToErrorsHash = new Object2IntOpenHashMap<>();
 
@@ -315,8 +327,7 @@ public final class DartAnalysisServerService implements Disposable {
 
     @Override
     public void computedClosingLabels(@NotNull String filePathOrUri, @NotNull List<ClosingLabel> labels) {
-      DartFileInfo fileInfo = DartFileInfoKt.getDartFileInfo(myProject, filePathOrUri);
-      myServerData.computedClosingLabels(fileInfo, labels);
+      DartAnalysisServerService.this.computedClosingLabels(filePathOrUri, labels);
     }
 
     @Override
@@ -353,7 +364,7 @@ public final class DartAnalysisServerService implements Disposable {
 
       for (DartFileInfo fileInfo : fileInfos) {
         if (fileInfo instanceof DartLocalFileInfo localFileInfo) {
-          onErrorsUpdated(localFileInfo, AnalysisError.EMPTY_LIST, false, 0);
+          onErrorsUpdated(localFileInfo, AnalysisError.EMPTY_LIST, 0);
         }
       }
     }
@@ -456,6 +467,41 @@ public final class DartAnalysisServerService implements Disposable {
       myServerData.textDocumentContentDidChange(fileUri);
     }
   };
+
+  @VisibleForTesting
+  public void computedClosingLabels(@NotNull String filePathOrUri, @NotNull List<ClosingLabel> labels) {
+    DartFileInfo fileInfo = DartFileInfoKt.getDartFileInfo(myProject, filePathOrUri);
+    myServerData.computedClosingLabels(fileInfo, labels);
+
+    // Backward-compatibility adapter for SDKs < 3.14.0-219.0.dev that emit legacy
+    // analysis.closingLabels instead of dart/textDocument/publishClosingLabels.
+    // Note: this method is invoked on the Analysis Server reader thread, which must never call
+    // runReadAction synchronously (otherwise it deadlocks if the EDT holds the write lock while
+    // awaiting an Analysis Server response, e.g. during MoveFileRefactoring).
+    boolean lspClosingLabelsEnabled = !mySdkVersion.isEmpty() &&
+                                      isDartSdkVersionSufficientForLspClosingLabels(mySdkVersion);
+    if (!lspClosingLabelsEnabled) {
+      VirtualFile file = fileInfo.findFile();
+      if (file == null && fileInfo instanceof DartLocalFileInfo localFileInfo) {
+        String path = FileUtil.toSystemIndependentName(localFileInfo.getFilePath());
+        file = VirtualFileManager.getInstance().findFileByUrl("temp://" + path);
+      }
+      if (file != null && file.isValid()) {
+        Document document = FileDocumentManager.getInstance().getCachedDocument(file);
+        if (document != null) {
+          List<DartServerData.DartClosingLabel> convertedLabels = myServerData.getClosingLabels(file);
+          CharSequence text = document.getImmutableCharSequence();
+          List<DartLspClosingLabel> lspLabels = convertedLabels.stream().map(label -> {
+            int endOffset = Math.min(label.getOffset() + label.getLength(), text.length());
+            int endLine = StringUtil.offsetToLineNumber(text, endOffset);
+            Position pos = new Position(endLine, 0);
+            return new DartLspClosingLabel(label.getLabel(), new Range(pos, pos));
+          }).toList();
+          DartLspClosingLabelsService.getInstance(myProject).updateClosingLabels(file, lspLabels);
+        }
+      }
+    }
+  }
 
   private static int ensureNotZero(int i) {
     return i == 0 ? Integer.MAX_VALUE : i;
@@ -569,14 +615,25 @@ public final class DartAnalysisServerService implements Disposable {
                                                          boolean supportsLspDiagnostics,
                                                          boolean supportsLspClosingLabels,
                                                          boolean supportsLspCodeActions) {
+    return buildLspCapabilities(sdkVersion, supportsLspDiagnostics, supportsLspClosingLabels, supportsLspCodeActions, false);
+  }
+
+  public static @NotNull JsonObject buildLspCapabilities(@NotNull String sdkVersion,
+                                                         boolean supportsLspDiagnostics,
+                                                         boolean supportsLspClosingLabels,
+                                                         boolean supportsLspCodeActions,
+                                                         boolean supportsLspConfiguration) {
     JsonObject lspCapabilities = new JsonObject();
 
     JsonObject workspace = new JsonObject();
 
-    // Without this the server never asks for the `dart` configuration section, so the settings of
-    // Settings | Editor | Inlay Hints would never reach it. It is advertised unconditionally: a
-    // server that does not support `workspace/configuration` parses and ignores it.
-    workspace.addProperty("configuration", true);
+    if (supportsLspConfiguration) {
+      // Without this the server never asks for the `dart` configuration section, so the settings of
+      // Settings | Editor | Inlay Hints would never reach it. It is only advertised once the
+      // DartBridgeLspServer is connected to the LSP client, so workspace/configuration is handled
+      // through DartBridgeLspServer -> DartLspServerDescriptor.getWorkspaceConfiguration.
+      workspace.addProperty("configuration", true);
+    }
 
     if (isDartSdkVersionSufficientForWorkspaceApplyEdits(sdkVersion)) {
       workspace.addProperty("applyEdit", true);
@@ -590,7 +647,9 @@ public final class DartAnalysisServerService implements Disposable {
       workspace.add("fileOperations", fileOperations);
     }
 
-    lspCapabilities.add("workspace", workspace);
+    if (workspace.size() > 0) {
+      lspCapabilities.add("workspace", workspace);
+    }
 
     JsonObject textDocument = new JsonObject();
 
@@ -742,11 +801,62 @@ public final class DartAnalysisServerService implements Disposable {
   }
 
   public static boolean isLspClosingLabelsEnabled(final @NotNull Project project) {
+    final DartSdk sdk = DartSdk.getDartSdk(project);
+    return sdk != null && isDartSdkVersionSufficientForLspClosingLabels(sdk.getVersion());
+  }
+
+  public static boolean isDartSdkVersionSufficientForLspHighlighting(@NotNull String sdkVersion) {
+    return DartSdkUpdateChecker.compareDartSdkVersions(sdkVersion, MIN_LSP_HIGHLIGHTING_SDK_VERSION) >= 0;
+  }
+
+  public static boolean isLspHighlightingEnabled(final @NotNull Project project) {
     if (!DartConfigurable.isExperimentalLspFeaturesEnabled(project)) {
       return false;
     }
     final DartSdk sdk = DartSdk.getDartSdk(project);
-    return sdk != null && isDartSdkVersionSufficientForLspClosingLabels(sdk.getVersion());
+    return sdk != null && isDartSdkVersionSufficientForLspHighlighting(sdk.getVersion());
+  }
+
+  public static boolean isLspHighlightingActive(final @NotNull Project project) {
+    if (!isLspHighlightingEnabled(project)) {
+      return false;
+    }
+    return getInstance(project).isSemanticTokensAdvertised();
+  }
+
+  public boolean isSemanticTokensAdvertised() {
+    return mySemanticTokensAdvertised;
+  }
+
+  public void setSemanticTokensAdvertised(boolean advertised) {
+    if (mySemanticTokensAdvertised != advertised) {
+      mySemanticTokensAdvertised = advertised;
+      analysis_setSubscriptions();
+      ApplicationManager.getApplication().invokeLater(() -> {
+        if (!myProject.isDisposed()) {
+          DaemonCodeAnalyzer.getInstance(myProject).restart("Dart semantic tokens advertisement changed");
+        }
+      }, ModalityState.nonModal(), myDisposedCondition);
+    }
+  }
+
+  public @Nullable SemanticTokensLegend getSemanticTokensLegend() {
+    return mySemanticTokensLegend;
+  }
+
+  @VisibleForTesting
+  public void setSemanticTokensLegend(@Nullable SemanticTokensLegend legend) {
+    mySemanticTokensLegend = legend;
+    if (legend != null) {
+      mySemanticTokensLegendFuture.get().complete(legend);
+    } else {
+      mySemanticTokensLegendFuture.set(new CompletableFuture<>());
+      setSemanticTokensAdvertised(false);
+    }
+  }
+
+  public @NotNull CompletableFuture<SemanticTokensLegend> getSemanticTokensLegendFuture() {
+    return mySemanticTokensLegendFuture.get();
   }
 
   public static boolean isDartSdkVersionSufficientForLspCodeActions(@NotNull String sdkVersion) {
@@ -984,6 +1094,7 @@ public final class DartAnalysisServerService implements Disposable {
         updateCurrentFile();
 
         if (isLocalAnalyzableFile(file)) {
+          myServerData.onFileOpened(file);
           updateVisibleFiles();
         }
       }
@@ -992,7 +1103,13 @@ public final class DartAnalysisServerService implements Disposable {
       public void selectionChanged(@NotNull FileEditorManagerEvent event) {
         updateCurrentFile();
 
-        if (isLocalAnalyzableFile(event.getOldFile()) || isLocalAnalyzableFile(event.getNewFile())) {
+        final VirtualFile newFile = event.getNewFile();
+        final boolean isNewFileAnalyzable = isLocalAnalyzableFile(newFile);
+
+        if (isLocalAnalyzableFile(event.getOldFile()) || isNewFileAnalyzable) {
+          if (isNewFileAnalyzable) {
+            myServerData.onFileOpened(newFile);
+          }
           updateVisibleFiles();
         }
       }
@@ -1019,10 +1136,9 @@ public final class DartAnalysisServerService implements Disposable {
       public void beforeDocumentChange(@NotNull DocumentEvent e) {
         if (myServer == null) return;
 
-        myServerData.onDocumentChanged(e);
-
         final VirtualFile file = FileDocumentManager.getInstance().getFile(e.getDocument());
         if (isLocalAnalyzableFile(file)) {
+          myServerData.onDocumentChanged(e);
           for (VirtualFile fileInEditor : FileEditorManager.getInstance(myProject).getOpenFiles()) {
             if (fileInEditor.equals(file)) {
               synchronized (myLock) {
@@ -1031,10 +1147,9 @@ public final class DartAnalysisServerService implements Disposable {
               break;
             }
           }
+          myUpdateFilesAlarm.cancelAllRequests();
+          myUpdateFilesAlarm.addRequest(DartAnalysisServerService.this::updateFilesContent, UPDATE_FILES_TIMEOUT);
         }
-
-        myUpdateFilesAlarm.cancelAllRequests();
-        myUpdateFilesAlarm.addRequest(DartAnalysisServerService.this::updateFilesContent, UPDATE_FILES_TIMEOUT);
       }
     };
 
@@ -1257,6 +1372,9 @@ public final class DartAnalysisServerService implements Disposable {
         myServerData.onFilesContentUpdated();
       });
     }
+    else {
+      myServerData.onFilesContentUpdated();
+    }
   }
 
   public void ensureAnalysisRootsUpToDate() {
@@ -1301,12 +1419,8 @@ public final class DartAnalysisServerService implements Disposable {
     }
 
     final List<AnalysisError> errorsWithoutTodo = errors.isEmpty() ? Collections.emptyList() : new ArrayList<>(errors.size());
-    boolean hasSevereProblems = false;
 
     for (AnalysisError error : errors) {
-      if (AnalysisErrorSeverity.ERROR.equals(error.getSeverity())) {
-        hasSevereProblems = true;
-      }
       if (!AnalysisErrorType.TODO.equals(error.getType())) {
         errorsWithoutTodo.add(error);
       }
@@ -1316,8 +1430,8 @@ public final class DartAnalysisServerService implements Disposable {
 
     if (fileInfo instanceof DartLocalFileInfo localFileInfo) {
       int oldHash;
-      synchronized (myFilePathsWithErrors) {
-        // TObjectIntHashMap returns 0 if there's no such entry, it's equivalent to empty error set for this file
+      synchronized (myFilePathToErrorsHash) {
+        // Object2IntMap returns 0 if there's no such entry, it's equivalent to empty error set for this file
         oldHash = myFilePathToErrorsHash.getInt(localFileInfo.getFilePath());
       }
 
@@ -1332,60 +1446,29 @@ public final class DartAnalysisServerService implements Disposable {
 
     if (myServerData.computedErrors(fileInfo, errorsWithoutTodo, restartHighlighting)) {
       if (fileInfo instanceof DartLocalFileInfo localFileInfo) {
-        onErrorsUpdated(localFileInfo, errorsWithoutTodo, hasSevereProblems, newHash);
+        onErrorsUpdated(localFileInfo, errorsWithoutTodo, newHash);
       }
     }
   }
 
   private void onErrorsUpdated(@NotNull DartLocalFileInfo localFileInfo,
                                @NotNull List<? extends AnalysisError> errors,
-                               boolean hasSevereProblems,
                                int errorsHash) {
     String filePath = localFileInfo.getFilePath();
-    updateFilesWithErrorsSet(filePath, hasSevereProblems, errorsHash);
-    DartProblemsView.getInstance(myProject).updateErrorsForFile(filePath, errors);
-  }
-
-  private void updateFilesWithErrorsSet(final @NotNull String filePath, final boolean hasSevereProblems, final int errorsHash) {
-    synchronized (myFilePathsWithErrors) {
+    synchronized (myFilePathToErrorsHash) {
       if (errorsHash == 0) {
-        // no errors
         myFilePathToErrorsHash.removeInt(filePath);
       }
       else {
         myFilePathToErrorsHash.put(filePath, errorsHash);
       }
-
-      if (hasSevereProblems) {
-        if (myFilePathsWithErrors.add(filePath)) {
-          String parentPath = PathUtil.getParentPath(filePath);
-          while (!parentPath.isEmpty()) {
-            final int count = myFolderPathsWithErrors.getInt(parentPath); // returns zero if there were no path in the map
-            myFolderPathsWithErrors.put(parentPath, count + 1);
-            parentPath = PathUtil.getParentPath(parentPath);
-          }
-        }
-      }
-      else {
-        if (myFilePathsWithErrors.remove(filePath)) {
-          String parentPath = PathUtil.getParentPath(filePath);
-          while (!parentPath.isEmpty()) {
-            final int count = myFolderPathsWithErrors.removeInt(parentPath); // returns zero if there was no path in the map
-            if (count > 1) {
-              myFolderPathsWithErrors.put(parentPath, count - 1);
-            }
-            parentPath = PathUtil.getParentPath(parentPath);
-          }
-        }
-      }
     }
+    DartProblemsView.getInstance(myProject).updateErrorsForFile(filePath, errors);
   }
 
   private void clearAllErrors() {
-    synchronized (myFilePathsWithErrors) {
-      myFilePathsWithErrors.clear();
+    synchronized (myFilePathToErrorsHash) {
       myFilePathToErrorsHash.clear();
-      myFolderPathsWithErrors.clear();
     }
 
     if (myInitializationOnServerStartupDone) {
@@ -2194,12 +2277,20 @@ public final class DartAnalysisServerService implements Disposable {
     }
   }
 
+  public void updateSubscriptions() {
+    synchronized (myLock) {
+      analysis_setSubscriptions();
+    }
+  }
+
   private void analysis_setSubscriptions() {
     synchronized (myLock) {
       if (myServer == null) return;
 
       final Map<String, List<String>> subscriptions = new HashMap<>();
-      subscriptions.put(AnalysisService.HIGHLIGHTS, myVisibleFileUris);
+      if (!isLspHighlightingActive(myProject)) {
+        subscriptions.put(AnalysisService.HIGHLIGHTS, myVisibleFileUris);
+      }
       subscriptions.put(AnalysisService.NAVIGATION, myVisibleFileUris);
       subscriptions.put(AnalysisService.OVERRIDES, myVisibleFileUris);
       subscriptions.put(AnalysisService.OUTLINE, myVisibleFileUris);
@@ -2536,14 +2627,9 @@ public final class DartAnalysisServerService implements Disposable {
         // This must be done after myServer is set, and should be done each time the server starts.
         registerPostfixCompletionTemplates();
 
-        myDtdUri = null;
-        DartToolingDaemonService dtdService = myProject.getServiceIfCreated(DartToolingDaemonService.class);
-        String dtdUri = dtdService != null ? dtdService.getUri() : null;
-        if (dtdUri != null) {
-          connectToDtd(dtdUri);
-        }
-
-        // Start the LSP Bridge Server unless in unit test mode
+        // Start the LSP Bridge Server unless in unit test mode.
+        // Once initialized, DartLspServerDescriptor.lspServerListener connects the server to DTD
+        // via dart/connectToDtd if DartToolingDaemonService is already running.
         if (!ApplicationManager.getApplication().isUnitTestMode()) {
           myProject.getService(DartBridgeLspServerManager.class).startBridgeServer();
         }
@@ -2637,6 +2723,9 @@ public final class DartAnalysisServerService implements Disposable {
       mySdkHome = null;
       mySdkVersion = "";
       myServerVersion = "";
+      mySemanticTokensLegend = null;
+      mySemanticTokensLegendFuture.set(new CompletableFuture<>());
+      setSemanticTokensAdvertised(false);
       // The next server starts out knowing nothing about the settings of this client.
       DartLspConfigurationSync configurationSync = myProject.getServiceIfCreated(DartLspConfigurationSync.class);
       if (configurationSync != null) {
@@ -2654,18 +2743,17 @@ public final class DartAnalysisServerService implements Disposable {
     }
   }
 
-  public void connectToDtd(@NotNull String uri) {
-    AnalysisServer server = myServer;
-    if (server == null) {
-      return;
-    }
-
-    boolean supportsWorkspaceApplyEdits = isDartSdkVersionSufficientForWorkspaceApplyEdits(mySdkVersion);
-    // Connection to DTD is used for server-initiated edits (workspace.applyEdits)
-    if (supportsWorkspaceApplyEdits && !uri.equals(myDtdUri)) {
-      myDtdUri = uri;
-      server.lsp_connectToDtd(uri);
-    }
+  /**
+   * Stops the analysis server and waits (bounded) for its process to exit, so that
+   * shutdown-time side effects such as flushing analytics have happened on return.
+   * <p>
+   * Blocks the calling thread for up to {@code SEND_REQUEST_TIMEOUT}, plus the time
+   * {@code StdioServerSocket.stop()} needs to force the process down if it doesn't exit.
+   */
+  @TestOnly
+  public void stopServer_TESTS_ONLY() {
+    assert ApplicationManager.getApplication().isUnitTestMode();
+    stopServer();
   }
 
   public void waitForAnalysisToComplete_TESTS_ONLY(final @NotNull VirtualFile file) {
@@ -2711,15 +2799,7 @@ public final class DartAnalysisServerService implements Disposable {
   }
 
   public boolean isFileWithErrors(final @NotNull VirtualFile file) {
-    synchronized (myFilePathsWithErrors) {
-      return file.isDirectory() ? myFolderPathsWithErrors.getInt(file.getPath()) > 0 : myFilePathsWithErrors.contains(file.getPath());
-    }
-  }
-
-  public int getFilePathsWithErrorsHash() {
-    synchronized (myFilePathsWithErrors) {
-      return myFilePathsWithErrors.hashCode();
-    }
+    return DartProblemsView.getInstance(myProject).isFileWithErrors(file);
   }
 
   private void logError(final @NonNls @NotNull String methodName, final @Nullable String filePath, final @NotNull RequestError error) {
@@ -2892,16 +2972,86 @@ public final class DartAnalysisServerService implements Disposable {
   }
 
   public void updateClientCapabilities() {
+    DartBridgeLspServerManager bridgeManager = myProject.getServiceIfCreated(DartBridgeLspServerManager.class);
+    updateClientCapabilities(bridgeManager != null && bridgeManager.isClientConnected());
+  }
+
+  public void updateClientCapabilities(boolean supportsLspConfiguration) {
     final RemoteAnalysisServerImpl server = myServer;
     if (server != null) {
       boolean supportsUris = isDartSdkVersionSufficientForFileUri(mySdkVersion);
       boolean supportsLspDiagnostics = isLspPublishDiagnosticsEnabled(myProject);
       boolean supportsLspClosingLabels = isLspClosingLabelsEnabled(myProject);
       boolean supportsLspCodeActions = isLspCodeActionsEnabled(myProject);
-      server.server_setClientCapabilities(List.of("openUrlRequest", "showMessageRequest"),
-                                          supportsUris,
-                                          buildLspCapabilities(mySdkVersion, supportsLspDiagnostics, supportsLspClosingLabels, supportsLspCodeActions));
+      server.server_setClientCapabilities(
+        List.of("openUrlRequest", "showMessageRequest"),
+        supportsUris,
+        buildLspCapabilities(mySdkVersion, supportsLspDiagnostics, supportsLspClosingLabels, supportsLspCodeActions,
+                             supportsLspConfiguration),
+        new JsonConsumer() {
+          @Override
+          public void onResponse(JsonObject resultObject, RequestError requestError) {
+            handleClientCapabilitiesResponse(resultObject, requestError);
+          }
+        }
+      );
     }
+  }
+
+  @VisibleForTesting
+  public void handleClientCapabilitiesResponse(@Nullable JsonObject resultObject, @Nullable RequestError requestError) {
+    if (requestError != null || resultObject == null) {
+      mySemanticTokensLegendFuture.get().complete(null);
+      return;
+    }
+    try {
+      if (resultObject.has("lspCapabilities")) {
+        JsonElement lspCapsElem = resultObject.get("lspCapabilities");
+        if (lspCapsElem != null && lspCapsElem.isJsonObject()) {
+          JsonObject lspCaps = lspCapsElem.getAsJsonObject();
+          if (lspCaps.has("semanticTokensProvider")) {
+            JsonElement providerElem = lspCaps.get("semanticTokensProvider");
+            if (providerElem != null && providerElem.isJsonObject()) {
+              JsonObject provider = providerElem.getAsJsonObject();
+              if (provider.has("legend")) {
+                JsonElement legendElem = provider.get("legend");
+                if (legendElem != null && legendElem.isJsonObject()) {
+                  JsonObject legendObj = legendElem.getAsJsonObject();
+                  List<String> types = new ArrayList<>();
+                  if (legendObj.has("tokenTypes")) {
+                    JsonElement typesElem = legendObj.get("tokenTypes");
+                    if (typesElem != null && typesElem.isJsonArray()) {
+                      for (JsonElement e : typesElem.getAsJsonArray()) {
+                        types.add(e.getAsString());
+                      }
+                    }
+                  }
+                  List<String> modifiers = new ArrayList<>();
+                  if (legendObj.has("tokenModifiers")) {
+                    JsonElement modsElem = legendObj.get("tokenModifiers");
+                    if (modsElem != null && modsElem.isJsonArray()) {
+                      for (JsonElement e : modsElem.getAsJsonArray()) {
+                        modifiers.add(e.getAsString());
+                      }
+                    }
+                  }
+                  if (!types.isEmpty()) {
+                    SemanticTokensLegend legend = new SemanticTokensLegend(types, modifiers);
+                    mySemanticTokensLegend = legend;
+                    mySemanticTokensLegendFuture.get().complete(legend);
+                    return;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    catch (Exception ex) {
+      LOG.warn("Failed to parse semantic tokens legend from DAS", ex);
+    }
+    mySemanticTokensLegendFuture.get().complete(null);
   }
 
   public void sendResponse(JsonObject response) {
@@ -2938,9 +3088,13 @@ public final class DartAnalysisServerService implements Disposable {
   }
 
   @VisibleForTesting
-
   public void setServer(@Nullable RemoteAnalysisServerImpl server) {
     myServer = server;
+    if (server == null) {
+      mySemanticTokensLegend = null;
+      mySemanticTokensLegendFuture.set(new CompletableFuture<>());
+      setSemanticTokensAdvertised(false);
+    }
   }
 
   /**
@@ -3000,3 +3154,5 @@ public final class DartAnalysisServerService implements Disposable {
     return uri != null ? uri.toString() : url;
   }
 }
+
+

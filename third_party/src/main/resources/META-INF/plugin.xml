@@ -32,6 +32,7 @@
   </extensionPoints>
 
   <extensions defaultExtensionNs="com.intellij">
+    <errorHandler implementation="com.intellij.diagnostic.JetBrainsMarketplaceErrorReportSubmitter"/>
     <moveFileHandler implementation="com.jetbrains.lang.dart.ide.refactoring.moveFile.DartServerMoveDartFileHandler"/>
     <fileType name="Dart" extensions="dart" language="Dart" implementationClass="com.jetbrains.lang.dart.DartFileType" fieldName="INSTANCE"/>
     <lang.syntaxHighlighter language="Dart" implementationClass="com.jetbrains.lang.dart.highlight.DartSyntaxHighlighter"/>
@@ -51,6 +52,7 @@
     <lang.lineWrapStrategy language="Dart" implementationClass="com.jetbrains.lang.dart.ide.editor.DartLineWrapPositionStrategy"/>
     <stripTrailingSpacesFilterFactory implementation="com.jetbrains.lang.dart.ide.editor.DartStripTrailingSpacesFilterFactory"/>
     <copyPastePostProcessor implementation="com.jetbrains.lang.dart.ide.editor.DartCopyPasteProcessor"/>
+    <copyPastePreProcessor implementation="com.jetbrains.lang.dart.ide.editor.DartDocLineCommentCopyPastePreProcessor" order="last"/>
     <autoImportOptionsProvider instance="com.jetbrains.lang.dart.ide.editor.DartAutoImportOptionsProvider"/>
 
     <multiHostInjector implementation="com.jetbrains.lang.dart.injection.DartMultiHostInjector"/>
@@ -73,7 +75,6 @@
     <psi.referenceContributor language="Dart" implementation="com.jetbrains.lang.dart.psi.DartReferenceContributor"/>
     <psi.referenceContributor language="XML" implementation="com.jetbrains.lang.dart.psi.DartReferenceContributor"/>
     <xml.xmlTypedHandlersAdditionalSupport implementation="com.jetbrains.lang.dart.xml.DartXmlTypedHandlersAdditionalSupport" />
-    <typeHierarchyProvider language="Dart" implementationClass="com.jetbrains.lang.dart.ide.hierarchy.type.DartTypeHierarchyProvider"/>
     <callHierarchyProvider language="Dart" implementationClass="com.jetbrains.lang.dart.ide.hierarchy.call.DartCallHierarchyProvider"/>
     <methodHierarchyProvider language="Dart" implementationClass="com.jetbrains.lang.dart.ide.hierarchy.method.DartMethodHierarchyProvider"/>
     <lang.elementManipulator forClass="com.jetbrains.lang.dart.psi.DartUriElement"
