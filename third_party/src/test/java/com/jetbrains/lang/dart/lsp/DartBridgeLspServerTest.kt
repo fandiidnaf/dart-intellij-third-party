@@ -2831,6 +2831,196 @@ class DartBridgeLspServerTest : DartCodeInsightFixtureTestCase() {
         }
     }
 
+    fun testCompletionTagsNamedArgumentAndResolvesDoc() {
+        val code = """
+            class A {
+              /// this is a doc
+              final String a;
+              new({required this.a});
+            }
+
+            void main() {
+              A(a);
+            }
+        """.trimIndent()
+        val psiFile = myFixture.addFileToProject("main.dart", code)
+        myFixture.configureFromExistingVirtualFile(psiFile.getVirtualFile())
+
+        val offsetInCall = code.indexOf("A(a)") + 3
+        val line = code.substring(0, offsetInCall).count { it == '\n' }
+        val character = offsetInCall - (code.substring(0, offsetInCall).lastIndexOf('\n') + 1)
+
+        val params = CompletionParams().apply {
+            textDocument = TextDocumentIdentifier(psiFile.virtualFile.url)
+            position = Position(line, character)
+        }
+
+        val future = bridgeServer.completion(params)
+        val responseJson = """
+            {
+              "id": "123",
+              "result": {
+                "lspResponse": {
+                  "jsonrpc": "2.0",
+                  "id": "123",
+                  "result": {
+                    "isIncomplete": false,
+                    "items": [
+                      {
+                        "label": "a:",
+                        "labelDetails": {
+                          "detail": " String"
+                        },
+                        "kind": 6,
+                        "detail": "String"
+                      },
+                      {
+                        "label": "print",
+                        "kind": 3,
+                        "detail": "void print(Object? object)"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        capturedListener.onResponse(responseJson)
+
+        val result = future.get(5, TimeUnit.SECONDS)
+        val items = result.right.items
+        assertEquals(2, items.size)
+
+        val namedArgItem = items[0]
+        assertNotNull("Expected synthetic marker on named-argument item", namedArgItem.data)
+        assertNull("Non-named-arg item should not be tagged", items[1].data)
+
+        val paramOffset = code.indexOf("this.a") + "this.".length
+        val paramLocation = org.dartlang.analysis.server.protocol.Location(
+            psiFile.virtualFile.url,
+            paramOffset,
+            1,
+            4,
+            21,
+            4,
+            22
+        )
+        val element = org.dartlang.analysis.server.protocol.Element(
+            org.dartlang.analysis.server.protocol.ElementKind.PARAMETER,
+            "a",
+            paramLocation,
+            0x04,
+            null,
+            "String",
+            null,
+            null
+        )
+        val suggestion = org.dartlang.analysis.server.protocol.CompletionSuggestion(
+            org.dartlang.analysis.server.protocol.CompletionSuggestionKind.NAMED_ARGUMENT,
+            950,
+            "a: ",
+            null,
+            null,
+            null,
+            3,
+            0,
+            false,
+            false,
+            "this is a doc",
+            "this is a doc",
+            null,
+            null,
+            null,
+            element,
+            null, // returnType
+            null, // parameterNames
+            null, // parameterTypes
+            null, // requiredParameterCount
+            null, // hasNamedParameters
+            "a",  // parameterName
+            "String", // parameterType
+            null, // libraryUri
+            null  // isNotImported
+        )
+
+        var fetchCount = 0
+        bridgeServer.fetchCompletionSuggestions2 = { _, _ ->
+            fetchCount++
+            listOf(suggestion)
+        }
+
+        val requestCountBeforeResolve = capturedRequests.size
+        val resolved = bridgeServer.resolveCompletionItem(namedArgItem).get(5, TimeUnit.SECONDS)
+
+        assertEquals("Synthetic named-arg resolution should not send lsp.handle", requestCountBeforeResolve, capturedRequests.size)
+        assertNull("Internal data marker must be stripped after resolution", resolved.data)
+        assertEquals(1, fetchCount)
+        assertNotNull("Expected documentation on resolved named argument", resolved.documentation)
+        val markdown = resolved.documentation.right.value
+        assertTrue("Expected required String a signature, got: $markdown", markdown.contains("{required String a}"))
+        assertTrue("Expected containing class info, got: $markdown", markdown.contains("Declared in `A`."))
+        assertTrue("Expected doc comment, got: $markdown", markdown.contains("this is a doc"))
+    }
+
+    fun testCompletionResolveNamedArgumentWithoutDocCommentShowsType() {
+        val code = """
+            class A {
+              final String a;
+              new({this.a = ''});
+            }
+
+            void main() {
+              A(a);
+            }
+        """.trimIndent()
+        val psiFile = myFixture.addFileToProject("plain.dart", code)
+        myFixture.configureFromExistingVirtualFile(psiFile.getVirtualFile())
+
+        val offsetInCall = code.indexOf("A(a)") + 3
+        val line = code.substring(0, offsetInCall).count { it == '\n' }
+        val character = offsetInCall - (code.substring(0, offsetInCall).lastIndexOf('\n') + 1)
+
+        val params = CompletionParams().apply {
+            textDocument = TextDocumentIdentifier(psiFile.virtualFile.url)
+            position = Position(line, character)
+        }
+
+        val future = bridgeServer.completion(params)
+        val responseJson = """
+            {
+              "id": "123",
+              "result": {
+                "lspResponse": {
+                  "jsonrpc": "2.0",
+                  "id": "123",
+                  "result": {
+                    "isIncomplete": false,
+                    "items": [
+                      {
+                        "label": "a: ",
+                        "filterText": "a:",
+                        "kind": 6,
+                        "detail": "String"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+        capturedListener.onResponse(responseJson)
+        val item = future.get(5, TimeUnit.SECONDS).right.items[0]
+
+        bridgeServer.fetchCompletionSuggestions2 = { _, _ -> emptyList() }
+        val resolved = bridgeServer.resolveCompletionItem(item).get(5, TimeUnit.SECONDS)
+
+        assertNull(resolved.data)
+        assertNotNull(resolved.documentation)
+        val markdown = resolved.documentation.right.value
+        assertTrue("Expected fallback type signature, got: $markdown", markdown.contains("{String a}"))
+    }
+
     private class MockLanguageClient : DartLanguageClient {
         var publishedDiagnostics: PublishDiagnosticsParams? = null
         var publishedClosingLabels: DartPublishClosingLabelsParams? = null

@@ -6,11 +6,21 @@ import com.intellij.codeInsight.lookup.Lookup;
 import com.intellij.codeInsight.lookup.LookupElement;
 import com.intellij.codeInsight.lookup.LookupEx;
 import com.intellij.codeInsight.lookup.LookupManager;
+import com.intellij.openapi.application.ReadAction;
+import com.intellij.platform.backend.documentation.AsyncDocumentation;
+import com.intellij.platform.backend.documentation.DocumentationData;
+import com.intellij.platform.backend.documentation.DocumentationResult;
+import com.intellij.platform.backend.documentation.DocumentationTarget;
+import com.intellij.testFramework.PlatformTestUtil;
 import com.intellij.testFramework.fixtures.CodeInsightFixtureTestCase;
 import com.intellij.testFramework.fixtures.impl.CodeInsightTestFixtureImpl;
 import com.intellij.util.containers.ContainerUtil;
 import com.jetbrains.lang.dart.analyzer.DartAnalysisServerService;
+import com.jetbrains.lang.dart.lsp.DartBridgeLspServerManager;
+import com.jetbrains.lang.dart.sdk.DartConfigurable;
 import com.jetbrains.lang.dart.util.DartTestUtils;
+import kotlin.coroutines.EmptyCoroutineContext;
+import kotlinx.coroutines.BuildersKt;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -187,6 +197,57 @@ public class DartServerCompletionTest extends CodeInsightFixtureTestCase {
     myFixture.doHighlighting();
     myFixture.completeBasic();
     assertNull(myFixture.getLookup());
+  }
+
+  public void testLspNamedArgCompletionDoc() throws Exception {
+    DartConfigurable.setExperimentalLspFeaturesEnabled(getProject(), true);
+    DartAnalysisServerService das = DartAnalysisServerService.getInstance(getProject());
+    myFixture.configureByText("main.dart",
+                              """
+                                /// this is A class
+                                class A {
+                                  /// this is a doc
+                                  final String a;
+                                  final String ab;
+
+                                  new({required this.a, this.ab = ''});
+                                }
+
+                                void main(List<String> args) {
+                                  A(a<caret>)
+                                }
+                                """);
+    DartBridgeLspServerManager bridgeManager = getProject().getService(DartBridgeLspServerManager.class);
+    bridgeManager.startBridgeServer();
+    try {
+      long deadline = System.currentTimeMillis() + 10_000;
+      while (!bridgeManager.isClientConnected() && System.currentTimeMillis() < deadline) {
+        PlatformTestUtil.dispatchAllEventsInIdeEventQueue();
+        Thread.sleep(50);
+      }
+      assertTrue("Bridge LSP server should be connected", bridgeManager.isClientConnected());
+      das.updateClientCapabilities(true);
+      myFixture.doHighlighting();
+      myFixture.complete(CompletionType.BASIC);
+      LookupEx activeLookup = LookupManager.getActiveLookup(getEditor());
+      assertNotNull("Expected active lookup", activeLookup);
+      LookupElement aItem = ContainerUtil.find(activeLookup.getItems(), e -> e.getLookupString().startsWith("a:"));
+      assertNotNull("Expected 'a:' in lookup items", aItem);
+      Object obj = aItem.getObject();
+      assertTrue("Expected DocumentationTarget, got " + obj.getClass(), obj instanceof DocumentationTarget);
+      DocumentationTarget target = (DocumentationTarget)obj;
+      DocumentationResult docResult = ReadAction.compute(() -> target.computeDocumentation());
+      if (docResult instanceof AsyncDocumentation asyncDoc) {
+        docResult = BuildersKt.runBlocking(EmptyCoroutineContext.INSTANCE, (scope, cont) -> asyncDoc.getSupplier().invoke(cont));
+      }
+      assertTrue("Expected DocumentationData, got " + docResult, docResult instanceof DocumentationData);
+      String html = ((DocumentationData)docResult).getHtml();
+      assertTrue("Expected field doc in HTML: " + html, html.contains("this is a doc"));
+      assertTrue("Expected required String a in HTML: " + html, html.contains("required") && html.contains("String") && html.contains("a"));
+    } finally {
+      bridgeManager.stopBridgeServer();
+      DartConfigurable.setExperimentalLspFeaturesEnabled(getProject(), false);
+    }
   }
 
   // TODO(jwren) revisit to fix or remove

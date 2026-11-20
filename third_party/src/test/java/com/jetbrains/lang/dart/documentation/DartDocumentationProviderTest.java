@@ -157,4 +157,27 @@ public class DartDocumentationProviderTest extends DartCodeInsightFixtureTestCas
     assertTrue("Expected doc to contain field documentation", doc.contains("name bro"));
     assertTrue("Expected doc to contain containing class info", doc.contains("Containing class:</b> Main"));
   }
+
+  public void testNewConstructorFieldFormalParameterLookupDoc() {
+    final PsiFile psiFile = myFixture.addFileToProject("main.dart",
+      "class A {\n" +
+      "  /// this is a doc\n" +
+      "  final String a;\n" +
+      "  new({required this.a});\n" +
+      "}");
+    myFixture.configureFromExistingVirtualFile(psiFile.getVirtualFile());
+
+    final int paramOffset = psiFile.getText().indexOf("this.a") + "this.".length();
+    final org.dartlang.analysis.server.protocol.Location location =
+      new org.dartlang.analysis.server.protocol.Location(psiFile.getVirtualFile().getPath(), paramOffset, 1, 4, 21, 4, 22);
+    final DartLookupObject lookupObject = new DartLookupObject(getProject(), location, 0);
+
+    final PsiElement resolvedElement = myProvider.getDocumentationElementForLookupItem(getPsiManager(), lookupObject, null);
+    assertNotNull("Expected resolved element for new(...) constructor field parameter lookup", resolvedElement);
+
+    final String doc = myProvider.generateDoc(resolvedElement, null);
+    assertNotNull("Expected generated doc for new(...) constructor field parameter lookup", doc);
+    assertTrue("Expected doc to contain field documentation", doc.contains("this is a doc"));
+    assertTrue("Expected doc to contain containing class info", doc.contains("Containing class:</b> A"));
+  }
 }
