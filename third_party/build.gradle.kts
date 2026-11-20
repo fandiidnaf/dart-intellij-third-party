@@ -362,13 +362,16 @@ tasks.register<PrintVersionTask>("printVersion") {
 
 tasks.named<Zip>("buildPlugin") {
     val v = intellijPlatform.pluginConfiguration.version
+    val pluginNameProp = providers.gradleProperty("pluginName")
     archiveFileName.set(v.map { versionStr ->
         if (project.hasProperty("versionedName")) {
             if (commitHash.isNotEmpty() && !versionStr.contains(commitHash)) {
-                "Dart-$versionStr-$commitHash.zip"
+                "${pluginNameProp.get()}-$versionStr-$commitHash.zip"
             } else {
-                "Dart-$versionStr.zip"
+                "${pluginNameProp.get()}-$versionStr.zip"
             }
+        } else if (providers.gradleProperty("pluginVersion").isPresent) {
+            "${pluginNameProp.get()}-$versionStr.zip"
         } else {
             "Dart.zip"
         }
