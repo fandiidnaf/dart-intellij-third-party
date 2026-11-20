@@ -67,12 +67,9 @@ public final class DartDocUtil {
       }
     }
 
-    if (!(element instanceof DartComponent) && !(element.getParent() instanceof DartComponent)) {
+    DartComponent namedComponent = findDartComponent(element);
+    if (namedComponent == null) {
       return null;
-    }
-    DartComponent namedComponent = (DartComponent)(element instanceof DartComponent ? element : element.getParent());
-    if (namedComponent instanceof DartComponentName && namedComponent.getParent() instanceof DartComponent) {
-      namedComponent = (DartComponent)namedComponent.getParent();
     }
 
     final String signatureHtml;
@@ -334,7 +331,19 @@ public final class DartDocUtil {
   }
 
 
-  private static @Nullable String getDocumentationText(final DartComponent dartComponent) {
+  public static @Nullable DartComponent findDartComponent(final @Nullable PsiElement element) {
+    if (element == null) return null;
+    if (!(element instanceof DartComponent) && !(element.getParent() instanceof DartComponent)) {
+      return null;
+    }
+    DartComponent namedComponent = (DartComponent)(element instanceof DartComponent ? element : element.getParent());
+    if (namedComponent instanceof DartComponentName && namedComponent.getParent() instanceof DartComponent) {
+      namedComponent = (DartComponent)namedComponent.getParent();
+    }
+    return namedComponent;
+  }
+
+  public static @Nullable String getDocumentationText(final @NotNull DartComponent dartComponent) {
     // PSI is not perfect currently, doc comment may be not part of the corresponding DartComponent element, so docs are searched for in several places:
     // - direct child of this DartComponent
     // - previous sibling (or previous sibling of parent element if this element is first child of its parent DartClassMembers)

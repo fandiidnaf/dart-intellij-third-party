@@ -15,13 +15,34 @@ import com.google.gson.JsonParser
 import com.google.gson.reflect.TypeToken
 import com.intellij.openapi.application.ex.ApplicationManagerEx
 import com.intellij.openapi.application.runReadAction
+import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.vfs.VirtualFileManager
+import com.intellij.psi.PsiManager
+import com.intellij.psi.util.PsiTreeUtil
+import com.intellij.util.concurrency.AppExecutorUtil
+import com.jetbrains.lang.dart.DartTokenTypes
 import com.jetbrains.lang.dart.analyzer.DartAnalysisServerService
+import com.jetbrains.lang.dart.analyzer.getDartFileInfo
+import com.jetbrains.lang.dart.analyzer.getOffsetInDocument
+import com.jetbrains.lang.dart.ide.completion.DartLookupObject
+import com.jetbrains.lang.dart.ide.documentation.DartDocUtil
 import com.jetbrains.lang.dart.logging.PluginLogger
+import com.jetbrains.lang.dart.psi.DartClass
+import com.jetbrains.lang.dart.psi.DartFieldFormalParameter
+import com.jetbrains.lang.dart.psi.DartNormalFormalParameter
+import org.dartlang.analysis.server.protocol.CompletionMode
+import org.dartlang.analysis.server.protocol.CompletionSuggestion
+import org.dartlang.analysis.server.protocol.CompletionSuggestionKind
+import org.dartlang.analysis.server.protocol.DartLspPosition
+import org.dartlang.analysis.server.protocol.Location as DasLocation
 import org.eclipse.lsp4j.CompletionItem
 import org.eclipse.lsp4j.CompletionList
 import org.eclipse.lsp4j.CompletionOptions
 import org.eclipse.lsp4j.CompletionParams
+import org.eclipse.lsp4j.MarkupContent
+import org.eclipse.lsp4j.MarkupKind
 import org.eclipse.lsp4j.ApplyWorkspaceEditParams
 import org.eclipse.lsp4j.CallHierarchyIncomingCall
 import org.eclipse.lsp4j.CallHierarchyIncomingCallsParams
@@ -127,10 +148,34 @@ class DartBridgeLspServer(private val project: Project) : DartLanguageServer, Te
         private const val LSP_NOTIFICATION_EVENT = "lsp.notification"
         private const val LSP_RESPONSE_KEY = "lspResponse"
         private const val JSONRPC_VERSION = "2.0"
+        private const val NAMED_ARG_DATA_KEY = "__dartBridgeNamedArg"
+        private const val NAMED_ARG_SUGGESTIONS_MAX_RESULTS = 500
         
         // We use a JSON handler with default lsp4j configuration to serialize/deserialize lsp4j objects.
         private val JSON_HANDLER = MessageJsonHandler(mapOf())
         private val GSON: Gson = JSON_HANDLER.gson
+    }
+
+    private data class NamedArgContext(val uri: String, val line: Int, val character: Int)
+    private data class CachedNamedArgSuggestions(
+        val filePath: String,
+        val offset: Int,
+        val modStamp: Long,
+        val suggestions: List<CompletionSuggestion>,
+    )
+    private data class PsiNamedArgDetails(
+        val isRequired: Boolean,
+        val containingClass: String?,
+        val docText: String?,
+    )
+
+    @Volatile
+    private var lastNamedArgSuggestionsCache: CachedNamedArgSuggestions? = null
+    private val namedArgResolveLock = Any()
+
+    // Overridable in tests.
+    internal var fetchCompletionSuggestions2: (VirtualFile, Int) -> List<CompletionSuggestion>? = { file, offset ->
+        das.completion_getSuggestions2(file, offset, NAMED_ARG_SUGGESTIONS_MAX_RESULTS, CompletionMode.BASIC, 1)?.mySuggestions
     }
 
     @Volatile
@@ -476,7 +521,11 @@ class DartBridgeLspServer(private val project: Project) : DartLanguageServer, Te
 
     override fun completion(params: CompletionParams): CompletableFuture<Either<List<CompletionItem>, CompletionList>> {
         return forwardRequest("textDocument/completion", params, CompletionList::class.java).thenApply { list ->
-            Either.forRight<List<CompletionItem>, CompletionList>(list ?: CompletionList(false, emptyList()))
+            val completionList = list ?: CompletionList(false, emptyList())
+            if (completionList.itemDefaults?.data == null) {
+                tagNamedArgumentItems(completionList.items, params)
+            }
+            Either.forRight<List<CompletionItem>, CompletionList>(completionList)
         }.exceptionally { e ->
             logger.info("textDocument/completion failed: ${e.message}")
             Either.forRight<List<CompletionItem>, CompletionList>(CompletionList(false, emptyList()))
@@ -484,11 +533,196 @@ class DartBridgeLspServer(private val project: Project) : DartLanguageServer, Te
     }
 
     override fun resolveCompletionItem(unresolved: CompletionItem): CompletableFuture<CompletionItem> {
+        val namedArgCtx = extractNamedArgContext(unresolved.data)
+        if (namedArgCtx != null) {
+            // Strip synthetic marker so it is never leaked or forwarded to DAS.
+            unresolved.data = null
+            if (unresolved.documentation != null) {
+                return CompletableFuture.completedFuture(unresolved)
+            }
+            return CompletableFuture.supplyAsync({
+                try {
+                    enrichNamedArgumentDocumentation(unresolved, namedArgCtx)
+                } catch (e: Exception) {
+                    logger.info("Failed to enrich named-argument documentation for ${unresolved.label}: ${e.message}")
+                }
+                unresolved
+            }, AppExecutorUtil.getAppExecutorService())
+        }
+
         return forwardRequest("completionItem/resolve", unresolved, CompletionItem::class.java).thenApply { resolved ->
             resolved ?: unresolved
         }.exceptionally { e ->
             logger.info("completionItem/resolve failed: ${e.message}")
             unresolved
+        }
+    }
+
+    private fun tagNamedArgumentItems(items: List<CompletionItem>?, params: CompletionParams) {
+        if (items.isNullOrEmpty()) return
+        for (item in items) {
+            if (isNamedArgumentCandidate(item)) {
+                item.data = createNamedArgContextData(params)
+            }
+        }
+    }
+
+    private fun isNamedArgumentCandidate(item: CompletionItem): Boolean {
+        if (item.documentation != null || item.data != null) return false
+        return item.label?.trimEnd()?.endsWith(":") == true || item.filterText?.trimEnd()?.endsWith(":") == true
+    }
+
+    private fun createNamedArgContextData(params: CompletionParams): JsonObject {
+        val ctxObj = JsonObject().apply {
+            addProperty("uri", params.textDocument.uri)
+            addProperty("line", params.position.line)
+            addProperty("character", params.position.character)
+        }
+        return JsonObject().apply {
+            add(NAMED_ARG_DATA_KEY, ctxObj)
+        }
+    }
+
+    private fun extractNamedArgContext(data: Any?): NamedArgContext? {
+        val jsonObj = when (data) {
+            is JsonObject -> data
+            is Map<*, *> -> runCatching { GSON.toJsonTree(data).asJsonObject }.getOrNull()
+            else -> null
+        } ?: return null
+
+        val ctxObj = jsonObj.getAsJsonObject(NAMED_ARG_DATA_KEY) ?: return null
+        val uri = ctxObj.get("uri")?.takeIf { it.isJsonPrimitive }?.asString ?: return null
+        val line = ctxObj.get("line")?.takeIf { it.isJsonPrimitive }?.asInt ?: return null
+        val character = ctxObj.get("character")?.takeIf { it.isJsonPrimitive }?.asInt ?: return null
+        return NamedArgContext(uri, line, character)
+    }
+
+    private fun enrichNamedArgumentDocumentation(item: CompletionItem, ctx: NamedArgContext) {
+        val vFile = getDartFileInfo(project, ctx.uri).findFile()
+            ?: VirtualFileManager.getInstance().findFileByUrl(ctx.uri)
+            ?: return
+
+        val (offset, modStamp) = runReadAction {
+            val document = FileDocumentManager.getInstance().getDocument(vFile) ?: return@runReadAction null
+            val resolvedOffset = getOffsetInDocument(document, DartLspPosition(ctx.line, ctx.character))
+                ?: document.textLength.coerceAtLeast(0)
+            resolvedOffset to document.modificationStamp
+        } ?: return
+
+        val suggestions = synchronized(namedArgResolveLock) {
+            val cached = lastNamedArgSuggestionsCache
+            if (cached != null &&
+                cached.filePath == vFile.path &&
+                cached.offset == offset &&
+                cached.modStamp == modStamp
+            ) {
+                cached.suggestions
+            } else {
+                runReadAction {
+                    das.updateFilesContent()
+                }
+                val fetched = fetchCompletionSuggestions2(vFile, offset)
+                val result = if (fetched.isNullOrEmpty()) {
+                    Thread.sleep(50)
+                    fetchCompletionSuggestions2(vFile, offset) ?: fetched
+                } else {
+                    fetched
+                }
+                if (!result.isNullOrEmpty()) {
+                    lastNamedArgSuggestionsCache = CachedNamedArgSuggestions(vFile.path, offset, modStamp, result)
+                }
+                result
+            }
+        }
+
+        val targetName = (item.filterText ?: item.label)
+            ?.trimEnd()
+            ?.removeSuffix(":")
+            ?.trim()
+            .orEmpty()
+        if (targetName.isEmpty()) return
+
+        val suggestion = suggestions?.firstOrNull { s ->
+            CompletionSuggestionKind.NAMED_ARGUMENT == s.kind &&
+                (s.parameterName == targetName ||
+                    s.completion?.trimEnd()?.removeSuffix(":")?.trim() == targetName)
+        }
+
+        val psiDetails = suggestion?.element?.location?.let { location ->
+            runReadAction { resolvePsiNamedArgDetails(location, suggestion.relevance) }
+        }
+
+        val markdown = buildNamedArgMarkdown(item, suggestion, targetName, psiDetails) ?: return
+        item.documentation = Either.forRight(MarkupContent(MarkupKind.MARKDOWN, markdown))
+    }
+
+    private fun resolvePsiNamedArgDetails(location: DasLocation, relevance: Int): PsiNamedArgDetails? {
+        val filePathOrUri = location.file ?: return null
+        val targetFile = resolveVirtualFile(filePathOrUri) ?: return null
+
+        val psiFile = PsiManager.getInstance(project).findFile(targetFile) ?: return null
+        val convertedOffset = das.getConvertedOffset(targetFile, location.offset)
+        val elementAtOffset = psiFile.findElementAt(convertedOffset)
+
+        val fieldFormalParam = PsiTreeUtil.getParentOfType(elementAtOffset, DartFieldFormalParameter::class.java, false)
+        val normalParam = PsiTreeUtil.getParentOfType(elementAtOffset, DartNormalFormalParameter::class.java, false)
+        val isRequired = fieldFormalParam?.node?.findChildByType(DartTokenTypes.REQUIRED) != null ||
+            normalParam?.node?.findChildByType(DartTokenTypes.REQUIRED) != null ||
+            normalParam?.simpleFormalParameter?.node?.findChildByType(DartTokenTypes.REQUIRED) != null ||
+            normalParam?.functionFormalParameter?.node?.findChildByType(DartTokenTypes.REQUIRED) != null
+
+        val resolvedPsi = DartLookupObject(project, location, relevance).findPsiElement()
+        val resolvedComponent = DartDocUtil.findDartComponent(resolvedPsi)
+        val containingClass = (resolvedComponent?.let { PsiTreeUtil.getParentOfType(it, DartClass::class.java) }
+            ?: PsiTreeUtil.getParentOfType(elementAtOffset, DartClass::class.java))?.name
+        val docText = resolvedComponent?.let { DartDocUtil.getDocumentationText(it) }
+
+        return PsiNamedArgDetails(isRequired = isRequired, containingClass = containingClass, docText = docText)
+    }
+
+    private fun resolveVirtualFile(filePathOrUri: String): VirtualFile? {
+        getDartFileInfo(project, filePathOrUri).findFile()?.let { return it }
+        val vfs = VirtualFileManager.getInstance()
+        vfs.findFileByUrl(filePathOrUri)?.let { return it }
+        if (!filePathOrUri.contains("://")) {
+            vfs.findFileByUrl("file://$filePathOrUri")?.let { return it }
+            vfs.findFileByUrl("temp://$filePathOrUri")?.let { return it }
+        }
+        return null
+    }
+
+    private fun buildNamedArgMarkdown(
+        item: CompletionItem,
+        suggestion: CompletionSuggestion?,
+        targetName: String,
+        psiDetails: PsiNamedArgDetails?,
+    ): String? {
+        val paramName = suggestion?.parameterName?.takeIf { it.isNotBlank() } ?: targetName
+        val typeStr = suggestion?.parameterType?.takeIf { it.isNotBlank() }
+            ?: suggestion?.element?.returnType?.takeIf { it.isNotBlank() }
+            ?: item.detail?.takeIf { it.isNotBlank() }
+        val docText = suggestion?.docComplete?.takeIf { it.isNotBlank() }
+            ?: suggestion?.docSummary?.takeIf { it.isNotBlank() }
+            ?: psiDetails?.docText?.takeIf { it.isNotBlank() }
+
+        if (typeStr == null && docText == null && psiDetails == null) return null
+
+        val requiredPrefix = if (psiDetails?.isRequired == true) "required " else ""
+        val signature = if (typeStr != null) "{$requiredPrefix$typeStr $paramName}" else "{$requiredPrefix$paramName}"
+
+        return buildString {
+            append("```dart\n")
+            append(signature)
+            append("\n```")
+            if (!psiDetails?.containingClass.isNullOrBlank()) {
+                append("\nDeclared in `")
+                append(psiDetails.containingClass)
+                append("`.")
+            }
+            if (docText != null) {
+                append("\n\n---\n")
+                append(docText)
+            }
         }
     }
 
